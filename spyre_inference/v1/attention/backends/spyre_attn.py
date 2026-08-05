@@ -220,6 +220,11 @@ def _create_compilable_reshape_and_cache(num_tokens: int):
     """Create a reshape_and_cache with fixed token count for torch.compile.
 
     Dynamo unrolls the loop because num_tokens is a closure constant.
+
+    No CPU round-trip: key/value arrive on the target device and are written
+    directly into the pages via narrow().copy_() at constant offsets.
+    Eager narrow().copy_() at a constant offset is now supported on Spyre
+    (the old torch.ops.spyre.overwrite workaround is no longer needed).
     """
 
     def specialized_reshape_and_cache_kernel(
@@ -229,13 +234,14 @@ def _create_compilable_reshape_and_cache(num_tokens: int):
         v_pages,
         block_indices,
         block_offsets,
-        target_device,
     ):
         for t in range(num_tokens):
-            k_tok = convert(key[t].unsqueeze(1).contiguous(), target_device)
-            v_tok = convert(value[t].unsqueeze(1).contiguous(), target_device)
-            _overwrite(k_tok, k_pages[block_indices[t]], [1], [block_offsets[t]])
-            _overwrite(v_tok, v_pages[block_indices[t]], [1], [block_offsets[t]])
+            # key[t] may be a strided view from the QKV split; .contiguous()
+            # ensures a valid copy source on Spyre before the narrow write.
+            k_tok = key[t].unsqueeze(1).contiguous()
+            v_tok = value[t].unsqueeze(1).contiguous()
+            k_pages[block_indices[t]].narrow(1, block_offsets[t], 1).copy_(k_tok)
+            v_pages[block_indices[t]].narrow(1, block_offsets[t], 1).copy_(v_tok)
 
     return specialized_reshape_and_cache_kernel
 
@@ -782,27 +788,21 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         _target_device = k_pages[0].device
         num_actual_tokens = attn_metadata.num_actual_tokens
 
-        # Spyre slicing corrupts memory, so
-        # bring q/k/v to CPU once for all slicing below; per-token slices get
-        # transferred to Spyre individually inside the scatter and attention paths.
-        key_cpu = convert(key, "cpu")
-        value_cpu = convert(value, "cpu")
-        query_cpu = convert(query, "cpu")
-
-        # Step 1: Reshape and cache — write new tokens into pages
+        # Step 1: Reshape and cache — write new tokens into pages.
+        # key/value stay on _target_device; narrow().copy_() at constant
+        # offsets now works on Spyre, so no CPU round-trip is needed here.
         self._reshape_and_cache(
-            key_cpu[:num_actual_tokens],
-            value_cpu[:num_actual_tokens],
+            key[:num_actual_tokens],
+            value[:num_actual_tokens],
             k_pages,
             v_pages,
             attn_metadata.slot_block_indices[:num_actual_tokens],
             attn_metadata.slot_block_offsets[:num_actual_tokens],
-            _target_device,
         )
 
         # Step 2: Online softmax attention over pages (varlen)
         output = self._online_softmax_attention(
-            query_cpu[:num_actual_tokens],
+            query[:num_actual_tokens],
             k_pages,
             v_pages,
             attn_metadata,
@@ -815,35 +815,31 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
     @_record_function("spyre_attn::reshape_and_cache")
     def _reshape_and_cache(
         self,
-        key_cpu: torch.Tensor,
-        value_cpu: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
         k_pages: list[torch.Tensor],
         v_pages: list[torch.Tensor],
         block_indices: list[int],
         block_offsets: list[int],
-        _target_device: torch.device,
     ) -> None:
         """Write new K/V tokens into their respective pages.
 
-        key, value: [num_tokens, num_kv_heads, head_size]
+        key, value: [num_tokens, num_kv_heads, head_size] — on the target device.
         k_pages, v_pages: list[Tensor], each [num_kv_heads, block_size, head_size]
-        block_indices, block_offsets: precomputed from slot_mapping in metadata builder
+        block_indices, block_offsets: precomputed from slot_mapping in metadata builder.
+
+        No CPU round-trip: narrow().copy_() at constant block offsets is now
+        supported on Spyre, so key/value are written directly into their pages.
+        Per-token .contiguous() inside the kernel handles strided QKV-split views.
         """
-        num_tokens = key_cpu.shape[0]
-
-        # Force CPU contiguous: value from QKV split-along-last-dim is
-        # non-contiguous; transferring a non-contiguous CPU tensor to Spyre
-        # silently corrupts data (see custom_ops/silu_and_mul.py).
-        key_cpu = key_cpu.contiguous()
-        value_cpu = value_cpu.contiguous()
-
+        num_tokens = key.shape[0]
         fn = self._get_reshape_fn(num_tokens)
-        fn(key_cpu, value_cpu, k_pages, v_pages, block_indices, block_offsets, _target_device)
+        fn(key, value, k_pages, v_pages, block_indices, block_offsets)
 
     @_record_function("spyre_attn::online_softmax")
     def _online_softmax_attention(
         self,
-        query_cpu: torch.Tensor,
+        query: torch.Tensor,
         k_pages: list[torch.Tensor],
         v_pages: list[torch.Tensor],
         attn_metadata: SpyreAttentionMetadata,
@@ -894,7 +890,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             query_len = q_end - q_start
             kv_len = int(seq_lens[seq_idx].item())
 
-            q_seq = query_cpu[q_start:q_end]
+            q_seq = query[q_start:q_end]
 
             # Pad query to global aligned_max_query_len (uniform for all seqs)
             if aligned_max_query_len > query_len:
