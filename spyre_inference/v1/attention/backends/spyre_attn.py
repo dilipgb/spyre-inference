@@ -809,10 +809,13 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         num_actual_tokens = attn_metadata.num_actual_tokens
 
 <<<<<<< HEAD
+<<<<<<< HEAD
         # Step 1: Reshape and cache — write new tokens into pages.
         # key/value stay on _target_device; narrow().copy_() at constant
         # offsets now works on Spyre, so no CPU round-trip is needed here.
 =======
+=======
+>>>>>>> bcba56b (remove cpu fallback for reshape and cache)
         # Spyre slicing corrupts memory, so bring k/v to CPU for slicing.
         # Query handling depends on whether we can stay on device:
         #   - Single-sequence decode: on-device assembly works (offset 0), but
@@ -832,7 +835,15 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         query_cpu = convert(query, "cpu") if needs_query_cpu else None
 
         # Step 1: Reshape and cache — write new tokens into pages
+<<<<<<< HEAD
 >>>>>>> 480a8c3 (First attempt to use indirect access for varlen query layout (#284))
+=======
+=======
+        # Step 1: Reshape and cache — write new tokens into pages.
+        # key/value stay on _target_device; narrow().copy_() at constant
+        # offsets now works on Spyre, so no CPU round-trip is needed here.
+>>>>>>> f516a53 (remove cpu fallback for reshape and cache)
+>>>>>>> bcba56b (remove cpu fallback for reshape and cache)
         self._reshape_and_cache(
             key[:num_actual_tokens],
             value[:num_actual_tokens],
@@ -848,11 +859,19 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         query_dev = convert(query, _target_device) if not needs_query_cpu else None
         output = self._online_softmax_attention(
 <<<<<<< HEAD
+<<<<<<< HEAD
             query[:num_actual_tokens],
 =======
             query_dev,
             query_cpu[:num_actual_tokens] if query_cpu is not None else None,
 >>>>>>> 480a8c3 (First attempt to use indirect access for varlen query layout (#284))
+=======
+            query_dev,
+            query_cpu[:num_actual_tokens] if query_cpu is not None else None,
+=======
+            query[:num_actual_tokens],
+>>>>>>> f516a53 (remove cpu fallback for reshape and cache)
+>>>>>>> bcba56b (remove cpu fallback for reshape and cache)
             k_pages,
             v_pages,
             attn_metadata,
@@ -890,11 +909,19 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
     def _online_softmax_attention(
         self,
 <<<<<<< HEAD
+<<<<<<< HEAD
         query: torch.Tensor,
 =======
         query_dev: torch.Tensor | None,
         query_cpu: torch.Tensor | None,
 >>>>>>> 480a8c3 (First attempt to use indirect access for varlen query layout (#284))
+=======
+        query_dev: torch.Tensor | None,
+        query_cpu: torch.Tensor | None,
+=======
+        query: torch.Tensor,
+>>>>>>> f516a53 (remove cpu fallback for reshape and cache)
+>>>>>>> bcba56b (remove cpu fallback for reshape and cache)
         k_pages: list[torch.Tensor],
         v_pages: list[torch.Tensor],
         attn_metadata: SpyreAttentionMetadata,
@@ -956,6 +983,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             kv_len = int(seq_lens[seq_idx].item())
 
 <<<<<<< HEAD
+<<<<<<< HEAD
             q_seq = query[q_start:q_end]
 
             # Pad query to global aligned_max_query_len (uniform for all seqs)
@@ -966,6 +994,8 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                     mode="constant",
                     value=0.0,
 =======
+=======
+>>>>>>> bcba56b (remove cpu fallback for reshape and cache)
             if query_dev is not None and query_len == 1:
                 # Single-sequence decode: assemble the padded 4D query on device.
                 # The one real token is written at offset 0 (a safe Spyre write);
@@ -973,7 +1003,21 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 # Layout matches the CPU path: [KV, QPK, aligned_max_query_len, D].
                 q_row = query_dev.unbind(dim=0)[q_start].reshape(
                     num_kv_heads, num_queries_per_kv, 1, head_size
+<<<<<<< HEAD
 >>>>>>> 480a8c3 (First attempt to use indirect access for varlen query layout (#284))
+=======
+=======
+            q_seq = query[q_start:q_end]
+
+            # Pad query to global aligned_max_query_len (uniform for all seqs)
+            if aligned_max_query_len > query_len:
+                q_seq = torch.nn.functional.pad(
+                    q_seq,
+                    (0, 0, 0, 0, 0, aligned_max_query_len - query_len),
+                    mode="constant",
+                    value=0.0,
+>>>>>>> f516a53 (remove cpu fallback for reshape and cache)
+>>>>>>> bcba56b (remove cpu fallback for reshape and cache)
                 )
                 if aligned_max_query_len > 1:
                     q = torch.zeros(
