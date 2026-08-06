@@ -212,13 +212,18 @@ def _create_compilable_reshape_and_cache(num_tokens: int):
 
     Dynamo unrolls the loop because num_tokens is a closure constant.
 
-    key/value must be contiguous before entering this kernel (enforced by
-    _reshape_and_cache). Each token is written as a 2-D slice assignment:
-        k_pages[block_idx][:, offset, :] = key[t]   # [num_kv_heads, head_size]
-    This avoids unsqueeze() which would produce a [num_kv_heads, 1, head_size]
-    tensor — that shape triggers a Mod(d1, 32) stick expression in Spyre
-    Inductor (via both overwrite and narrow().copy_()), which is unsupported.
-    The 2-D assignment routes through __setitem__ without Inductor compilation.
+    key/value arrive on CPU (converted by _reshape_and_cache before the call).
+    Every D2D write primitive on the current torch-spyre — __setitem__,
+    narrow().copy_(), and torch.ops.spyre.overwrite — routes through
+    copy_from_d2d → compile_once → Inductor and fails with:
+        Mod(d1, 32): expected Mod(var, 64)
+    because the runtime block_offset cannot be resolved to a compile-time
+    constant stick coordinate. Until torch-spyre supports symbolic-offset
+    D2D writes, the write must happen on CPU and the result is transferred
+    to Spyre by the page allocation (pages live on Spyre; the CPU writes
+    into the CPU mirror and Spyre reads from it via DMA).
+    TODO: remove CPU round-trip when torch-spyre fixes copy_from_d2d for
+    runtime offsets (torch-spyre#XXX).
     """
 
     def specialized_reshape_and_cache_kernel(
@@ -228,10 +233,13 @@ def _create_compilable_reshape_and_cache(num_tokens: int):
         v_pages,
         block_indices,
         block_offsets,
+        target_device,
     ):
         for t in range(num_tokens):
-            k_pages[block_indices[t]][:, block_offsets[t], :] = key[t]
-            v_pages[block_indices[t]][:, block_offsets[t], :] = value[t]
+            k_tok = convert(key[t].unsqueeze(1).contiguous(), target_device)
+            v_tok = convert(value[t].unsqueeze(1).contiguous(), target_device)
+            k_pages[block_indices[t]].narrow(1, block_offsets[t], 1).copy_(k_tok)
+            v_pages[block_indices[t]].narrow(1, block_offsets[t], 1).copy_(v_tok)
 
     return specialized_reshape_and_cache_kernel
 
@@ -779,14 +787,18 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         num_actual_tokens = attn_metadata.num_actual_tokens
 
         # Step 1: Reshape and cache — write new tokens into pages.
-        # key/value arrive on _target_device; no CPU round-trip needed.
+        # key/value are converted to CPU before the call: every D2D write on
+        # Spyre (copy_from_d2d / overwrite) goes through compile_once → Inductor
+        # and fails with Mod(d1, 32) for runtime block_offsets. CPU round-trip
+        # is required until torch-spyre supports symbolic-offset D2D writes.
         self._reshape_and_cache(
-            key[:num_actual_tokens],
-            value[:num_actual_tokens],
+            convert(key[:num_actual_tokens], "cpu"),
+            convert(value[:num_actual_tokens], "cpu"),
             k_pages,
             v_pages,
             attn_metadata.slot_block_indices[:num_actual_tokens],
             attn_metadata.slot_block_offsets[:num_actual_tokens],
+            _target_device,
         )
 
         # Step 2: Online softmax attention over pages (varlen).
@@ -804,28 +816,29 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
     @_record_function("spyre_attn::reshape_and_cache")
     def _reshape_and_cache(
         self,
-        key: torch.Tensor,
-        value: torch.Tensor,
+        key_cpu: torch.Tensor,
+        value_cpu: torch.Tensor,
         k_pages: list[torch.Tensor],
         v_pages: list[torch.Tensor],
         block_indices: list[int],
         block_offsets: list[int],
+        target_device: torch.device,
     ) -> None:
         """Write new K/V tokens into their respective pages.
 
-        key, value: [num_tokens, num_kv_heads, head_size] — on target device.
+        key_cpu, value_cpu: [num_tokens, num_kv_heads, head_size] — on CPU.
         k_pages, v_pages: list[Tensor], each [num_kv_heads, block_size, head_size]
         block_indices, block_offsets: precomputed from slot_mapping in metadata builder
+        target_device: device where pages live (passed through to the kernel)
         """
-        num_tokens = key.shape[0]
-        # Make contiguous before the per-token loop: key/value from the QKV
-        # split are strided views whose per-token slices key[t] produce a
-        # Mod(d1, 32) stick expression that Spyre Inductor rejects. A full-
-        # tensor contiguous copy gives each key[t] a clean Mod(d1, 64) layout.
-        key = key.contiguous()
-        value = value.contiguous()
+        num_tokens = key_cpu.shape[0]
+        # Force CPU contiguous: value from QKV split-along-last-dim is
+        # non-contiguous; transferring a non-contiguous CPU tensor to Spyre
+        # silently corrupts data (see custom_ops/silu_and_mul.py).
+        key_cpu = key_cpu.contiguous()
+        value_cpu = value_cpu.contiguous()
         fn = self._get_reshape_fn(num_tokens)
-        fn(key, value, k_pages, v_pages, block_indices, block_offsets)
+        fn(key_cpu, value_cpu, k_pages, v_pages, block_indices, block_offsets, target_device)
 
     @_record_function("spyre_attn::online_softmax")
     def _online_softmax_attention(
