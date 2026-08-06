@@ -16,7 +16,6 @@
 
 import functools
 from dataclasses import dataclass
-from functools import lru_cache
 from typing import Callable, ClassVar, NamedTuple
 
 import os
@@ -28,7 +27,6 @@ from spyre_inference.custom_ops.utils import convert
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.config.cache import CacheDType
-from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -113,49 +111,6 @@ class SpyrePagedKVCache(NamedTuple):
     v_pages: list[torch.Tensor]
 
 
-def _overwrite_impl(
-    input: torch.Tensor,
-    output: torch.Tensor,
-    dims: list[int],
-    offsets: list[int],
-) -> None:
-    sliced_t = output
-    for i, dim in enumerate(dims):
-        sliced_t = torch.narrow(sliced_t, dim, offsets[i], 1)
-    sliced_t.copy_(input)
-
-
-def _overwrite_fake(
-    input: torch.Tensor,
-    output: torch.Tensor,
-    dims: list[int],
-    offsets: list[int],
-) -> None:
-    pass
-
-
-@lru_cache(maxsize=1)
-def _register_overwrite_op() -> None:
-    """Register spyre_overwrite as an opaque custom op.
-
-    Wrapping ``narrow().copy_()`` behind a custom op hides it from the outer
-    ``torch.compile`` graph so that the Spyre inductor never sees the
-    ``copy_from_d2d`` call that ``narrow().copy_()`` between two Spyre tensors
-    would otherwise produce — which fails with ``Mod(d1, 32)`` for
-    ``head_size=64``.  The op body runs eagerly; torch-spyre fixed the
-    silent-write-to-row-0 bug for eager narrow+copy (see
-    ``test_spyre_fallback_probes.py::test_spyre_eager_narrow_copy_at_offset``).
-    """
-    direct_register_custom_op(
-        op_name="spyre_overwrite",
-        op_func=_overwrite_impl,
-        fake_impl=_overwrite_fake,
-        mutates_args=["output"],
-        dispatch_key="CompositeExplicitAutograd",
-    )
-    logger.debug_once("Registered custom op: spyre_overwrite")
-
-
 def _overwrite(
     input: torch.Tensor,
     output: torch.Tensor,
@@ -164,14 +119,17 @@ def _overwrite(
 ) -> None:
     """Write ``input`` into ``output`` at the specified position (in-place).
 
-    Registered as an opaque custom op (``torch.ops.vllm.spyre_overwrite``) so
-    the ``narrow().copy_()`` body is never traced into outer ``torch.compile``
-    graphs — avoids the Spyre inductor ``Mod(d1, 32)`` stick error on
-    ``copy_from_d2d`` for ``head_size=64``.  Registration happens once via
-    ``_register_overwrite_op()`` called from ``SpyreAttentionBackend`` at
-    backend-init time.
+    When ``output`` is on Spyre and ``input`` is on CPU this is a H2D copy.
+    When both are on Spyre this is a D2D copy via torch-spyre's
+    ``copy_from_d2d``, which compiles via inductor — that compilation fails
+    with ``Mod(d1, 32)`` for ``head_size=64`` but succeeds for multiples of
+    128.  Callers that need to support ``head_size=64`` must ensure ``input``
+    is on CPU; see ``_reshape_and_cache``.
     """
-    torch.ops.vllm.spyre_overwrite(input, output, dims, offsets)
+    sliced_t = output
+    for i, dim in enumerate(dims):
+        sliced_t = torch.narrow(sliced_t, dim, offsets[i], 1)
+    sliced_t.copy_(input)
 
 
 def _indirect_matmul_mock(
@@ -283,6 +241,12 @@ def _create_compilable_reshape_and_cache(num_tokens: int):
     """Create a reshape_and_cache with fixed token count for torch.compile.
 
     Dynamo unrolls the loop because num_tokens is a closure constant.
+
+    ``key`` and ``value`` must be on CPU before being passed here so that each
+    ``_overwrite`` is a H2D copy (CPU src → Spyre page dst).  A D2D copy
+    (Spyre → Spyre) dispatches through ``torch-spyre``'s ``copy_from_d2d``,
+    which internally compiles via inductor and fails with ``Mod(d1, 32)`` for
+    ``head_size=64``.
     """
 
     def specialized_reshape_and_cache_kernel(
@@ -294,8 +258,8 @@ def _create_compilable_reshape_and_cache(num_tokens: int):
         block_offsets,
     ):
         for t in range(num_tokens):
-            k_tok = key[t].unsqueeze(1).contiguous()
-            v_tok = value[t].unsqueeze(1).contiguous()
+            k_tok = key[t].unsqueeze(1)
+            v_tok = value[t].unsqueeze(1)
             _overwrite(k_tok, k_pages[block_indices[t]], [1], [block_offsets[t]])
             _overwrite(v_tok, v_pages[block_indices[t]], [1], [block_offsets[t]])
 
@@ -793,10 +757,6 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         self._reshape_fns: dict[int, object] = {}
         self._attn_fns: dict[tuple[int, int], object] = {}
 
-        # Register the spyre_overwrite custom op once (lru_cache makes it
-        # idempotent across all attention layer instances).
-        _register_overwrite_op()
-
         logger.debug_once("Using SpyreAttentionBackend with LIST-BASED online softmax")
 
     def _get_reshape_fn(self, num_tokens: int):
@@ -855,8 +815,10 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         #   - Batch decode / prefill: needs the CPU path because the per-seq
         #     query densification slices/transposes at offset > 0, which
         #     corrupts on Spyre.
-        # K/V reshape uses eager narrow().copy_() (device-agnostic, no
-        # head_size constraint) so no CPU detour is needed there.
+        # K/V reshape: narrow().copy_() from a Spyre src dispatches through
+        # torch-spyre's copy_from_d2d which compiles internally and fails with
+        # Mod(d1, 32) for head_size=64, so key/value must be on CPU for that
+        # case. For head_size multiples of 128, copy_from_d2d compiles fine.
         ondevice_overwrite_ok = self.head_size % ONDEVICE_OVERWRITE_HEAD_SIZE_MULTIPLE == 0
         needs_query_cpu = (
             attn_metadata.max_query_len > 1
@@ -908,6 +870,16 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         block_indices, block_offsets: precomputed from slot_mapping in metadata builder
         """
         num_tokens = key.shape[0]
+
+        # For head_size that is not a multiple of 128, a Spyre→Spyre copy_()
+        # dispatches through torch-spyre's copy_from_d2d, which compiles
+        # internally via inductor and fails with Mod(d1, 32).  Move K/V to CPU
+        # first so narrow().copy_() is a H2D transfer instead.
+        # For head_size multiples of 128, copy_from_d2d compiles fine — keep
+        # K/V on device to avoid an unnecessary D2H round-trip.
+        if key.device.type != "cpu" and self.head_size % ONDEVICE_OVERWRITE_HEAD_SIZE_MULTIPLE != 0:
+            key = convert(key, "cpu")
+            value = convert(value, "cpu")
 
         fn = self._get_reshape_fn(num_tokens)
         fn(key, value, k_pages, v_pages, block_indices, block_offsets)
