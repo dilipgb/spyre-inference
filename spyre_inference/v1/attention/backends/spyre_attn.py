@@ -82,8 +82,12 @@ KV_LENGTH_ALIGNMENT = 256
 # a smaller alignment (e.g. QUERY_CHUNK_SIZE=1) for single-token decode steps.
 QUERY_CHUNK_SIZE = 32
 
-# On-device query overwrite only compiles for head_size multiples of 128; 64
-# yields an unsupported Mod(var, 32) stick coord. Otherwise fall back to CPU.
+# On-device query assembly (unsqueeze + overwrite into the padded 4D query
+# tensor) only works for head_size multiples of 128.  head_size=64 produces a
+# Mod(var, 32) stick coord that Spyre inductor rejects.  The K/V reshape path
+# uses eager narrow().copy_() which is device-agnostic and has no such
+# constraint (torch-spyre fixed the silent-write-to-row-0 bug; see
+# test_spyre_fallback_probes.py::test_spyre_eager_narrow_copy_at_offset).
 ONDEVICE_OVERWRITE_HEAD_SIZE_MULTIPLE = 128
 
 
@@ -113,22 +117,19 @@ def _overwrite(
     dims: list[int],
     offsets: list[int],
 ) -> None:
-    """Write input into output at the specified position (in-place)."""
-    if output.device.type == "spyre":
-        # `torch.ops.spyre.overwrite` is dynamically registered, so its
-        # signature is opaque to the type checker (ParamSpec resolves to `...`).
-        torch.ops.spyre.overwrite(
-            input,  # ty: ignore[invalid-argument-type]
-            output,  # ty: ignore[invalid-argument-type]
-            dims,  # ty: ignore[invalid-argument-type]
-            offsets,  # ty: ignore[invalid-argument-type]
-        )
-    else:
-        # intended behaviour on cpu
-        sliced_t = output
-        for i, dim in enumerate(dims):
-            sliced_t = torch.narrow(sliced_t, dim, offsets[i], 1)
-        sliced_t.copy_(input)
+    """Write input into output at the specified position (in-place).
+
+    Previously used ``torch.ops.spyre.overwrite`` on Spyre, but eager
+    ``narrow().copy_()`` at a constant offset now works correctly on Spyre
+    (the prior silent-write-to-row-0 bug was fixed in torch-spyre; see
+    ``test_spyre_fallback_probes.py::test_spyre_eager_narrow_copy_at_offset``).
+    ``torch.ops.spyre.overwrite`` is also deprecated and fails to compile for
+    ``head_size=64`` (``Mod(d1, 32)`` stick expression).
+    """
+    sliced_t = output
+    for i, dim in enumerate(dims):
+        sliced_t = torch.narrow(sliced_t, dim, offsets[i], 1)
+    sliced_t.copy_(input)
 
 
 def _indirect_matmul_mock(
@@ -249,11 +250,10 @@ def _create_compilable_reshape_and_cache(num_tokens: int):
         v_pages,
         block_indices,
         block_offsets,
-        target_device,
     ):
         for t in range(num_tokens):
-            k_tok = convert(key[t].unsqueeze(1).contiguous())
-            v_tok = convert(value[t].unsqueeze(1).contiguous())
+            k_tok = key[t].unsqueeze(1).contiguous()
+            v_tok = value[t].unsqueeze(1).contiguous()
             _overwrite(k_tok, k_pages[block_indices[t]], [1], [block_offsets[t]])
             _overwrite(v_tok, v_pages[block_indices[t]], [1], [block_offsets[t]])
 
@@ -802,14 +802,15 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         _target_device = k_pages[0].device
         num_actual_tokens = attn_metadata.num_actual_tokens
 
-        # Spyre slicing corrupts memory, so bring k/v to CPU for slicing.
-        # Query handling depends on whether we can stay on device:
+        # Query handling depends on whether we can assemble it on-device:
         #   - Single-sequence decode: on-device assembly works (offset 0), but
         #     only when the head_size keeps the overwrite layout representable
         #     (see ONDEVICE_OVERWRITE_HEAD_SIZE_MULTIPLE); otherwise CPU path.
         #   - Batch decode / prefill: needs the CPU path because the per-seq
         #     query densification slices/transposes at offset > 0, which
         #     corrupts on Spyre.
+        # K/V reshape uses eager narrow().copy_() (device-agnostic, no
+        # head_size constraint) so no CPU detour is needed there.
         ondevice_overwrite_ok = self.head_size % ONDEVICE_OVERWRITE_HEAD_SIZE_MULTIPLE == 0
         needs_query_cpu = (
             attn_metadata.max_query_len > 1
@@ -826,7 +827,6 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             v_pages,
             attn_metadata.slot_block_indices[:num_actual_tokens],
             attn_metadata.slot_block_offsets[:num_actual_tokens],
-            _target_device,
         )
 
         # Step 2: Online softmax attention over pages (varlen).
@@ -854,7 +854,6 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         v_pages: list[torch.Tensor],
         block_indices: list[int],
         block_offsets: list[int],
-        _target_device: torch.device,
     ) -> None:
         """Write new K/V tokens into their respective pages.
 
