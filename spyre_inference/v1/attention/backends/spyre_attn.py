@@ -213,14 +213,12 @@ def _create_compilable_reshape_and_cache(num_tokens: int):
     Dynamo unrolls the loop because num_tokens is a closure constant.
 
     key/value must be contiguous before entering this kernel (enforced by
-    _reshape_and_cache) so that key[t] is a clean stride-1 slice and Spyre
-    Inductor can resolve its stick expression to Mod(d1, 64).  A strided
-    slice from the QKV split produces Mod(d1, 32) which the Spyre backend
-    rejects for both overwrite and narrow().copy_().
-
-    On Spyre: torch.ops.spyre.overwrite writes each token-slice into its page
-    at the correct offset without going through a strided narrow.
-    On CPU (unit tests): narrow().copy_() is used instead.
+    _reshape_and_cache). Each token is written as a 2-D slice assignment:
+        k_pages[block_idx][:, offset, :] = key[t]   # [num_kv_heads, head_size]
+    This avoids unsqueeze() which would produce a [num_kv_heads, 1, head_size]
+    tensor — that shape triggers a Mod(d1, 32) stick expression in Spyre
+    Inductor (via both overwrite and narrow().copy_()), which is unsupported.
+    The 2-D assignment routes through __setitem__ without Inductor compilation.
     """
 
     def specialized_reshape_and_cache_kernel(
@@ -232,14 +230,8 @@ def _create_compilable_reshape_and_cache(num_tokens: int):
         block_offsets,
     ):
         for t in range(num_tokens):
-            k_tok = key[t].unsqueeze(1)
-            v_tok = value[t].unsqueeze(1)
-            if k_pages[block_indices[t]].device.type == "spyre":
-                torch.ops.spyre.overwrite(k_tok, k_pages[block_indices[t]], [1], [block_offsets[t]])
-                torch.ops.spyre.overwrite(v_tok, v_pages[block_indices[t]], [1], [block_offsets[t]])
-            else:
-                k_pages[block_indices[t]].narrow(1, block_offsets[t], 1).copy_(k_tok)
-                v_pages[block_indices[t]].narrow(1, block_offsets[t], 1).copy_(v_tok)
+            k_pages[block_indices[t]][:, block_offsets[t], :] = key[t]
+            v_pages[block_indices[t]][:, block_offsets[t], :] = value[t]
 
     return specialized_reshape_and_cache_kernel
 
