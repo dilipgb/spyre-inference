@@ -252,8 +252,8 @@ def _create_compilable_reshape_and_cache(num_tokens: int):
         target_device,
     ):
         for t in range(num_tokens):
-            k_tok = convert(key[t].unsqueeze(1).contiguous(), target_device)
-            v_tok = convert(value[t].unsqueeze(1).contiguous(), target_device)
+            k_tok = convert(key[t].unsqueeze(1).contiguous())
+            v_tok = convert(value[t].unsqueeze(1).contiguous())
             _overwrite(k_tok, k_pages[block_indices[t]], [1], [block_offsets[t]])
             _overwrite(v_tok, v_pages[block_indices[t]], [1], [block_offsets[t]])
 
@@ -810,8 +810,6 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         #   - Batch decode / prefill: needs the CPU path because the per-seq
         #     query densification slices/transposes at offset > 0, which
         #     corrupts on Spyre.
-        key_cpu = convert(key, "cpu")
-        value_cpu = convert(value, "cpu")
         ondevice_overwrite_ok = self.head_size % ONDEVICE_OVERWRITE_HEAD_SIZE_MULTIPLE == 0
         needs_query_cpu = (
             attn_metadata.max_query_len > 1
@@ -822,8 +820,8 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
         # Step 1: Reshape and cache — write new tokens into pages
         self._reshape_and_cache(
-            key_cpu[:num_actual_tokens],
-            value_cpu[:num_actual_tokens],
+            key[:num_actual_tokens],
+            value[:num_actual_tokens],
             k_pages,
             v_pages,
             attn_metadata.slot_block_indices[:num_actual_tokens],
@@ -850,8 +848,8 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
     @_record_function("spyre_attn::reshape_and_cache")
     def _reshape_and_cache(
         self,
-        key_cpu: torch.Tensor,
-        value_cpu: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
         k_pages: list[torch.Tensor],
         v_pages: list[torch.Tensor],
         block_indices: list[int],
@@ -864,16 +862,10 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         k_pages, v_pages: list[Tensor], each [num_kv_heads, block_size, head_size]
         block_indices, block_offsets: precomputed from slot_mapping in metadata builder
         """
-        num_tokens = key_cpu.shape[0]
-
-        # Force CPU contiguous: value from QKV split-along-last-dim is
-        # non-contiguous; transferring a non-contiguous CPU tensor to Spyre
-        # silently corrupts data (see custom_ops/silu_and_mul.py).
-        key_cpu = key_cpu.contiguous()
-        value_cpu = value_cpu.contiguous()
+        num_tokens = key.shape[0]
 
         fn = self._get_reshape_fn(num_tokens)
-        fn(key_cpu, value_cpu, k_pages, v_pages, block_indices, block_offsets, _target_device)
+        fn(key, value, k_pages, v_pages, block_indices, block_offsets)
 
     @_record_function("spyre_attn::online_softmax")
     def _online_softmax_attention(
