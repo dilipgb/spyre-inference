@@ -535,12 +535,7 @@ def test_spyre_attn_decode_head_size(
     configure_compilation: str,
     configure_device: str,
 ) -> None:
-    """Single-sequence decode across head sizes (regression for #284).
-
-    head_size=64 is not representable by the on-device query overwrite and must
-    fall back to the CPU path; head_size=128 stays on device. Both must produce
-    correct output.
-    """
+    """Single-sequence decode correctness across head sizes."""
     _run_spyre_attn_test(
         seq_lens=[(1, 256)],
         block_size=128,
