@@ -881,6 +881,11 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             key = convert(key, "cpu")
             value = convert(value, "cpu")
 
+        # Force contiguous: key/value from a QKV split arrive as strided views;
+        # a non-contiguous source to narrow().copy_() produces wrong values.
+        key = key.contiguous()
+        value = value.contiguous()
+
         fn = self._get_reshape_fn(num_tokens)
         fn(key, value, k_pages, v_pages, block_indices, block_offsets)
 
