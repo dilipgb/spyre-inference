@@ -840,10 +840,9 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
         Writes results directly into the caller's output buffer in-place.
 
-        Query assembly builds the padded 4D tensor
-        [num_kv_heads, num_queries_per_kv, aligned_max_query_len, head_size]
-        the kernel expects. Slicing query[q_start:q_end] works on Spyre,
-        so no CPU round-trip is needed for query densification.
+        Query assembly: slice query[q_start:q_end] on device, bring to CPU
+        for pad + transpose + reshape (Spyre transpose+contiguous is broken),
+        then transfer the shaped 4D tensor to the target device for the kernel.
         """
         num_heads = self.num_heads
         head_size = self.head_size
@@ -881,7 +880,10 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             query_len = q_end - q_start
             kv_len = int(seq_lens[seq_idx].item())
 
-            q_seq = query[q_start:q_end]
+            # Bring this sequence's query slice to CPU for shape manipulation:
+            # transpose+contiguous on Spyre is broken (same issue as the result
+            # path below), so the pad/reshape must happen on CPU before H2D.
+            q_seq = convert(query[q_start:q_end], "cpu")
 
             # Pad query to global aligned_max_query_len (uniform for all seqs)
             if aligned_max_query_len > query_len:
@@ -895,7 +897,8 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             # Reshape: [padded_query_len, num_heads, head_size]
             #   → [num_kv_heads, num_queries_per_kv, padded_query_len, head_size]
             q = q_seq.unsqueeze(0).transpose(1, 2).contiguous()
-            q_dev = q.reshape(num_kv_heads, num_queries_per_kv, aligned_max_query_len, head_size)
+            q = q.reshape(num_kv_heads, num_queries_per_kv, aligned_max_query_len, head_size)
+            q_dev = convert(q, device=_target_device)
 
             num_blocks_needed = (kv_len + block_size - 1) // block_size
             page_indices = [int(block_table[seq_idx, i]) for i in range(num_blocks_needed)]
