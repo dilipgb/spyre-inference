@@ -212,10 +212,12 @@ def _create_compilable_reshape_and_cache(num_tokens: int):
 
     Dynamo unrolls the loop because num_tokens is a closure constant.
 
-    No CPU round-trip: key/value arrive on the target device and are written
-    directly into the pages via narrow().copy_() at constant offsets.
-    Eager narrow().copy_() at a constant offset is now supported on Spyre
-    (the old torch.ops.spyre.overwrite workaround is no longer needed).
+    No CPU round-trip: key/value arrive on Spyre and are written directly into
+    the pages via torch.ops.spyre.overwrite at constant offsets.
+    narrow().copy_() cannot be used here: a narrow on the block_size dimension
+    produces a Mod(d1, 32) stick coordinate that the Spyre Inductor backend
+    rejects. torch.ops.spyre.overwrite handles the offset write natively.
+    On CPU (unit tests) the fallback uses narrow().copy_() which works fine.
     """
 
     def specialized_reshape_and_cache_kernel(
@@ -227,12 +229,14 @@ def _create_compilable_reshape_and_cache(num_tokens: int):
         block_offsets,
     ):
         for t in range(num_tokens):
-            # key[t] may be a strided view from the QKV split; .contiguous()
-            # ensures a valid copy source on Spyre before the narrow write.
             k_tok = key[t].unsqueeze(1).contiguous()
             v_tok = value[t].unsqueeze(1).contiguous()
-            k_pages[block_indices[t]].narrow(1, block_offsets[t], 1).copy_(k_tok)
-            v_pages[block_indices[t]].narrow(1, block_offsets[t], 1).copy_(v_tok)
+            if k_pages[block_indices[t]].device.type == "spyre":
+                torch.ops.spyre.overwrite(k_tok, k_pages[block_indices[t]], [1], [block_offsets[t]])
+                torch.ops.spyre.overwrite(v_tok, v_pages[block_indices[t]], [1], [block_offsets[t]])
+            else:
+                k_pages[block_indices[t]].narrow(1, block_offsets[t], 1).copy_(k_tok)
+                v_pages[block_indices[t]].narrow(1, block_offsets[t], 1).copy_(v_tok)
 
     return specialized_reshape_and_cache_kernel
 
