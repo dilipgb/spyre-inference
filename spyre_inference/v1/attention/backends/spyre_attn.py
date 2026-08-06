@@ -212,12 +212,15 @@ def _create_compilable_reshape_and_cache(num_tokens: int):
 
     Dynamo unrolls the loop because num_tokens is a closure constant.
 
-    No CPU round-trip: key/value arrive on Spyre and are written directly into
-    the pages via torch.ops.spyre.overwrite at constant offsets.
-    narrow().copy_() cannot be used here: a narrow on the block_size dimension
-    produces a Mod(d1, 32) stick coordinate that the Spyre Inductor backend
-    rejects. torch.ops.spyre.overwrite handles the offset write natively.
-    On CPU (unit tests) the fallback uses narrow().copy_() which works fine.
+    key/value must be contiguous before entering this kernel (enforced by
+    _reshape_and_cache) so that key[t] is a clean stride-1 slice and Spyre
+    Inductor can resolve its stick expression to Mod(d1, 64).  A strided
+    slice from the QKV split produces Mod(d1, 32) which the Spyre backend
+    rejects for both overwrite and narrow().copy_().
+
+    On Spyre: torch.ops.spyre.overwrite writes each token-slice into its page
+    at the correct offset without going through a strided narrow.
+    On CPU (unit tests): narrow().copy_() is used instead.
     """
 
     def specialized_reshape_and_cache_kernel(
@@ -229,8 +232,8 @@ def _create_compilable_reshape_and_cache(num_tokens: int):
         block_offsets,
     ):
         for t in range(num_tokens):
-            k_tok = key[t].unsqueeze(1).contiguous()
-            v_tok = value[t].unsqueeze(1).contiguous()
+            k_tok = key[t].unsqueeze(1)
+            v_tok = value[t].unsqueeze(1)
             if k_pages[block_indices[t]].device.type == "spyre":
                 torch.ops.spyre.overwrite(k_tok, k_pages[block_indices[t]], [1], [block_offsets[t]])
                 torch.ops.spyre.overwrite(v_tok, v_pages[block_indices[t]], [1], [block_offsets[t]])
@@ -823,6 +826,12 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         block_indices, block_offsets: precomputed from slot_mapping in metadata builder
         """
         num_tokens = key.shape[0]
+        # Make contiguous before the per-token loop: key/value from the QKV
+        # split are strided views whose per-token slices key[t] produce a
+        # Mod(d1, 32) stick expression that Spyre Inductor rejects. A full-
+        # tensor contiguous copy gives each key[t] a clean Mod(d1, 64) layout.
+        key = key.contiguous()
+        value = value.contiguous()
         fn = self._get_reshape_fn(num_tokens)
         fn(key, value, k_pages, v_pages, block_indices, block_offsets)
 
