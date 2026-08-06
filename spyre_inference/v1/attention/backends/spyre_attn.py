@@ -16,6 +16,7 @@
 
 import functools
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Callable, ClassVar, NamedTuple
 
 import os
@@ -27,6 +28,7 @@ from spyre_inference.custom_ops.utils import convert
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.config.cache import CacheDType
+from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -111,25 +113,65 @@ class SpyrePagedKVCache(NamedTuple):
     v_pages: list[torch.Tensor]
 
 
+def _overwrite_impl(
+    input: torch.Tensor,
+    output: torch.Tensor,
+    dims: list[int],
+    offsets: list[int],
+) -> None:
+    sliced_t = output
+    for i, dim in enumerate(dims):
+        sliced_t = torch.narrow(sliced_t, dim, offsets[i], 1)
+    sliced_t.copy_(input)
+
+
+def _overwrite_fake(
+    input: torch.Tensor,
+    output: torch.Tensor,
+    dims: list[int],
+    offsets: list[int],
+) -> None:
+    pass
+
+
+@lru_cache(maxsize=1)
+def _register_overwrite_op() -> None:
+    """Register spyre_overwrite as an opaque custom op.
+
+    Wrapping ``narrow().copy_()`` behind a custom op hides it from the outer
+    ``torch.compile`` graph so that the Spyre inductor never sees the
+    ``copy_from_d2d`` call that ``narrow().copy_()`` between two Spyre tensors
+    would otherwise produce — which fails with ``Mod(d1, 32)`` for
+    ``head_size=64``.  The op body runs eagerly; torch-spyre fixed the
+    silent-write-to-row-0 bug for eager narrow+copy (see
+    ``test_spyre_fallback_probes.py::test_spyre_eager_narrow_copy_at_offset``).
+    """
+    direct_register_custom_op(
+        op_name="spyre_overwrite",
+        op_func=_overwrite_impl,
+        fake_impl=_overwrite_fake,
+        mutates_args=["output"],
+        dispatch_key="CompositeExplicitAutograd",
+    )
+    logger.debug_once("Registered custom op: spyre_overwrite")
+
+
 def _overwrite(
     input: torch.Tensor,
     output: torch.Tensor,
     dims: list[int],
     offsets: list[int],
 ) -> None:
-    """Write input into output at the specified position (in-place).
+    """Write ``input`` into ``output`` at the specified position (in-place).
 
-    Previously used ``torch.ops.spyre.overwrite`` on Spyre, but eager
-    ``narrow().copy_()`` at a constant offset now works correctly on Spyre
-    (the prior silent-write-to-row-0 bug was fixed in torch-spyre; see
-    ``test_spyre_fallback_probes.py::test_spyre_eager_narrow_copy_at_offset``).
-    ``torch.ops.spyre.overwrite`` is also deprecated and fails to compile for
-    ``head_size=64`` (``Mod(d1, 32)`` stick expression).
+    Registered as an opaque custom op (``torch.ops.vllm.spyre_overwrite``) so
+    the ``narrow().copy_()`` body is never traced into outer ``torch.compile``
+    graphs — avoids the Spyre inductor ``Mod(d1, 32)`` stick error on
+    ``copy_from_d2d`` for ``head_size=64``.  Registration happens once via
+    ``_register_overwrite_op()`` called from ``SpyreAttentionBackend`` at
+    backend-init time.
     """
-    sliced_t = output
-    for i, dim in enumerate(dims):
-        sliced_t = torch.narrow(sliced_t, dim, offsets[i], 1)
-    sliced_t.copy_(input)
+    torch.ops.vllm.spyre_overwrite(input, output, dims, offsets)
 
 
 def _indirect_matmul_mock(
@@ -750,6 +792,10 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         # by (num_blocks, padded_query_len) for the per-page attention loop)
         self._reshape_fns: dict[int, object] = {}
         self._attn_fns: dict[tuple[int, int], object] = {}
+
+        # Register the spyre_overwrite custom op once (lru_cache makes it
+        # idempotent across all attention layer instances).
+        _register_overwrite_op()
 
         logger.debug_once("Using SpyreAttentionBackend with LIST-BASED online softmax")
 
