@@ -189,8 +189,37 @@ def test_spyre_single_row_index_select(spyre_device):
 
 
 # Note: eager narrow().copy_() at a constant offset started working in a recent
-# torch-spyre dependency bump, so it is no longer xfail here. A follow-up PR
-# can remove the torch.ops.spyre.overwrite workaround in the attention backend.
+# torch-spyre dependency bump, so it is no longer xfail here.
+
+
+def test_spyre_d2d_narrow_copy_at_constant_offset(spyre_device):
+    """D2D eager narrow().copy_() at a constant Python-int offset (head_size=64).
+
+    This is the exact primitive used in _create_compilable_reshape_and_cache:
+        k_tok = key[t].unsqueeze(1).contiguous()   # [num_kv_heads, 1, head_size]
+        k_pages[blk].narrow(1, offset, 1).copy_(k_tok)
+
+    Both source (k_tok) and destination page are Spyre tensors. The offset is
+    a Python int constant (not a SymInt), making this an eager D2D write at a
+    fixed, compile-time-known position. If this test fails the K/V reshape path
+    must fall back to CPU before the narrow().copy_().
+    """
+    num_kv_heads = 2
+    head_size = 64
+    block_size = 64  # minimum valid block_size (multiple of 64)
+
+    # Source: a single-token K slice — matches key[t].unsqueeze(1).contiguous()
+    k_tok = torch.randn(num_kv_heads, 1, head_size, dtype=torch.float16, device=spyre_device)
+    # Destination: one KV page — matches k_pages[block_indices[t]]
+    page = torch.zeros(num_kv_heads, block_size, head_size, dtype=torch.float16, device=spyre_device)
+
+    # Write at a non-zero constant offset to exercise the full code path
+    offset = 37  # Python int constant — same as block_offsets[t] in the kernel
+    page.narrow(1, offset, 1).copy_(k_tok)
+
+    expected = torch.zeros(num_kv_heads, block_size, head_size, dtype=torch.float16)
+    expected[:, offset, :] = k_tok.cpu()[:, 0, :]
+    torch.testing.assert_close(page.cpu(), expected, atol=0, rtol=0)
 
 
 @pytest.mark.xfail(
