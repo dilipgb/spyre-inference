@@ -109,6 +109,31 @@ class SpyrePagedKVCache(NamedTuple):
     v_pages: list[torch.Tensor]
 
 
+def _overwrite(
+    input: torch.Tensor,
+    output: torch.Tensor,
+    dims: list[int],
+    offsets: list[int],
+) -> None:
+    """Write ``input`` into ``output`` at the specified position (in-place).
+
+    Used by SpyreEncoderAttentionImpl to scatter result tokens into the output
+    buffer. Not used for K/V cache writes (those go through _reshape_and_cache).
+    """
+    if output.device.type == "spyre":
+        torch.ops.spyre.overwrite(
+            input,  # ty: ignore[invalid-argument-type]
+            output,  # ty: ignore[invalid-argument-type]
+            dims,  # ty: ignore[invalid-argument-type]
+            offsets,  # ty: ignore[invalid-argument-type]
+        )
+    else:
+        sliced_t = output
+        for i, dim in enumerate(dims):
+            sliced_t = torch.narrow(sliced_t, dim, offsets[i], 1)
+        sliced_t.copy_(input)
+
+
 def _indirect_matmul_mock(
     a: torch.Tensor | list[torch.Tensor],
     address_or_index_of_a: int | torch.Tensor | list[int] | None,

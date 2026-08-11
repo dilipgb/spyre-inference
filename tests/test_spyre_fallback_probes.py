@@ -188,21 +188,35 @@ def test_spyre_single_row_index_select(spyre_device):
 # ---------------------------------------------------------------------------
 
 
-# Note: eager narrow().copy_() at a constant offset started working in a recent
-# torch-spyre dependency bump, so it is no longer xfail here.
+# Note: H2D narrow().copy_() (CPU src → Spyre dst) at a constant offset works.
+# D2D narrow().copy_() (Spyre src → Spyre dst) still fails — see
+# test_spyre_d2d_narrow_copy_at_constant_offset below.
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "Every D2D write on Spyre — narrow().copy_(), __setitem__, and "
+        "torch.ops.spyre.overwrite — routes through copy_from_d2d → "
+        "compile_once → Inductor. For head_size=64 this emits Mod(d1, 32) "
+        "(unsupported 2-level stick hierarchy). For head_size=128 it "
+        "recompiles per unique block_offset, exhausting Dynamo's 256-recompile "
+        "limit and then recursing into copy_from_d2d's own compile wrapper. "
+        "The K/V reshape path uses CPU round-trip (H2D DMA) until torch-spyre "
+        "fixes copy_from_d2d for runtime/symbolic offsets."
+    ),
+)
 def test_spyre_d2d_narrow_copy_at_constant_offset(spyre_device):
     """D2D eager narrow().copy_() at a constant Python-int offset (head_size=64).
 
-    This is the exact primitive used in _create_compilable_reshape_and_cache:
-        k_tok = key[t].unsqueeze(1).contiguous()   # [num_kv_heads, 1, head_size]
+    Exercises the exact write shape from _create_compilable_reshape_and_cache:
+        k_tok = convert(key[t].unsqueeze(1).contiguous(), target_device)
         k_pages[blk].narrow(1, offset, 1).copy_(k_tok)
 
-    Both source (k_tok) and destination page are Spyre tensors. The offset is
-    a Python int constant (not a SymInt), making this an eager D2D write at a
-    fixed, compile-time-known position. If this test fails the K/V reshape path
-    must fall back to CPU before the narrow().copy_().
+    Both tensors are on Spyre. Fails because copy_from_d2d compiles internally
+    and produces an unsupported Mod(d1, 32) stick expression for head_size=64,
+    or exhausts the recompile limit for head_size=128. Remove xfail when
+    torch-spyre supports D2D writes at runtime offsets without recompilation.
     """
     num_kv_heads = 2
     head_size = 64
