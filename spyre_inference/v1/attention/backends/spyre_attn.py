@@ -232,6 +232,15 @@ def _create_compilable_reshape_and_cache(num_tokens: int):
         for t in range(num_tokens):
             k_tok = key[t].unsqueeze(1).contiguous()
             v_tok = value[t].unsqueeze(1).contiguous()
+            logger.debug(
+                "reshape_and_cache kernel: t=%d blk=%d off=%d "
+                "k_tok shape=%s strides=%s device=%s "
+                "page shape=%s device=%s",
+                t, block_indices[t], block_offsets[t],
+                tuple(k_tok.shape), tuple(k_tok.stride()), k_tok.device,
+                tuple(k_pages[block_indices[t]].shape),
+                k_pages[block_indices[t]].device,
+            )
             k_pages[block_indices[t]].narrow(1, block_offsets[t], 1).copy_(k_tok)
             v_pages[block_indices[t]].narrow(1, block_offsets[t], 1).copy_(v_tok)
 
@@ -728,8 +737,6 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         # by (num_blocks, padded_query_len) for the per-page attention loop)
         self._reshape_fns: dict[int, object] = {}
         self._attn_fns: dict[tuple[int, int], object] = {}
-        # Tracks (num_tokens, key_shape) tuples already logged by _reshape_and_cache
-        self._logged_reshape_shapes: set[tuple] = set()
 
         logger.debug_once("Using SpyreAttentionBackend with LIST-BASED online softmax")
 
@@ -824,26 +831,23 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         """
         num_tokens = key.shape[0]
 
-        # Diagnostic: log shapes/strides/device before the write so that
-        # torch-spyre stick-expression failures can be traced to exact inputs.
-        # Logged once per unique (num_tokens, key_shape) to avoid spam.
-        log_key = (num_tokens, tuple(key.shape))
-        if log_key not in self._logged_reshape_shapes:
-            self._logged_reshape_shapes.add(log_key)
-            page = k_pages[block_indices[0]] if k_pages else None
-            logger.debug(
-                "reshape_and_cache: num_tokens=%d "
-                "key shape=%s strides=%s dtype=%s device=%s "
-                "value shape=%s strides=%s "
-                "page shape=%s device=%s "
-                "block_offsets[0]=%s",
-                num_tokens,
-                tuple(key.shape), tuple(key.stride()), key.dtype, key.device,
-                tuple(value.shape), tuple(value.stride()),
-                tuple(page.shape) if page is not None else None,
-                page.device if page is not None else None,
-                block_offsets[0] if block_offsets else None,
-            )
+        # Diagnostic: log every call — deduplication on shape alone hides calls
+        # with different block_offsets (e.g. decode steps with offset > 0).
+        page = k_pages[block_indices[0]] if k_pages else None
+        logger.debug(
+            "reshape_and_cache: num_tokens=%d "
+            "key shape=%s strides=%s dtype=%s device=%s "
+            "value shape=%s strides=%s "
+            "page shape=%s device=%s "
+            "block_indices=%s block_offsets=%s",
+            num_tokens,
+            tuple(key.shape), tuple(key.stride()), key.dtype, key.device,
+            tuple(value.shape), tuple(value.stride()),
+            tuple(page.shape) if page is not None else None,
+            page.device if page is not None else None,
+            block_indices,
+            block_offsets,
+        )
 
         fn = self._get_reshape_fn(num_tokens)
         fn(key, value, k_pages, v_pages, block_indices, block_offsets)
