@@ -236,16 +236,13 @@ def _create_compilable_reshape_and_cache(num_tokens: int, ondevice_write: bool):
     """Create a reshape_and_cache with fixed token count for torch.compile.
 
     Dynamo unrolls the loop because num_tokens is a closure constant.
-    ondevice_write=True  (head_size % 128 == 0):
-        key/value arrive on Spyre. narrow().copy_() produces a double-stick-
-        aligned source (128 fp16 elements) that copy_from_d2d handles correctly.
+    Full page writes (start_off == 0 and run_len == block_size) perform direct
+    on-device D2D copies on Spyre regardless of head_size because the full page
+    shape [num_kv_heads, block_size, head_size] is perfectly stick-aligned.
 
-    ondevice_write=False (head_size=64, i.e. head_size % 128 != 0):
-        key/value arrive on CPU (converted by forward() before the call).
-        Each token slice is transferred H2D individually via convert(), avoiding
-        copy_from_d2d entirely. copy_from_d2d fails for head_size=64 because
-        the [num_kv_heads, 1, 64] source has a 2-level stick hierarchy that
-        produces Mod(d1, 32) — unsupported by the Spyre Inductor backend.
+    Partial page writes for head_size=64 (ondevice_write=False) convert the
+    chunk slice to CPU first before transferring H2D, avoiding copy_from_d2d's
+    Mod(d1, 32) stick hierarchy issue for sub-page slices.
     """
 
     def specialized_reshape_and_cache_kernel(
@@ -257,6 +254,7 @@ def _create_compilable_reshape_and_cache(num_tokens: int, ondevice_write: bool):
         block_offsets,
         target_device,
     ):
+        block_size = k_pages[0].shape[1]
         t = 0
         while t < num_tokens:
             blk = block_indices[t]
@@ -269,12 +267,18 @@ def _create_compilable_reshape_and_cache(num_tokens: int, ondevice_write: bool):
             ):
                 run_len += 1
 
-            k_chunk = convert(
-                key[t : t + run_len].transpose(0, 1).contiguous(), target_device
-            )
-            v_chunk = convert(
-                value[t : t + run_len].transpose(0, 1).contiguous(), target_device
-            )
+            k_slice = key[t : t + run_len].transpose(0, 1).contiguous()
+            v_slice = value[t : t + run_len].transpose(0, 1).contiguous()
+
+            # Full page write or double-stick head_size: safe on-device D2D write!
+            is_full_page = (start_off == 0) and (run_len == block_size)
+            if not ondevice_write and not is_full_page:
+                k_chunk = convert(convert(k_slice, "cpu"), target_device)
+                v_chunk = convert(convert(v_slice, "cpu"), target_device)
+            else:
+                k_chunk = convert(k_slice, target_device)
+                v_chunk = convert(v_slice, target_device)
+
             k_pages[blk].narrow(1, start_off, run_len).copy_(k_chunk)
             v_pages[blk].narrow(1, start_off, run_len).copy_(v_chunk)
             t += run_len
@@ -835,14 +839,12 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         num_actual_tokens = attn_metadata.num_actual_tokens
 
         # Step 1: Reshape and cache — write new tokens into pages.
-        # For head_size % 128 == 0: key/value stay on Spyre (D2D narrow+copy).
-        # For head_size=64: convert to CPU first; H2D DMA avoids copy_from_d2d
-        # which fails with Mod(d1,32) for the [num_kv_heads,1,64] source shape.
+        # Key and Value stay on-device on Spyre. Full-page writes (prefill)
+        # perform direct on-device D2D copies for both head_size=64 and 128.
+        # Any partial-page slice for head_size=64 is converted to CPU within
+        # the kernel on a per-chunk basis to avoid Mod(d1, 32) stick errors.
         kv_key = key[:num_actual_tokens]
         kv_val = value[:num_actual_tokens]
-        if not self._ondevice_kv_write:
-            kv_key = convert(kv_key, "cpu").contiguous()
-            kv_val = convert(kv_val, "cpu").contiguous()
         # Query handling: single-sequence decode can assemble on-device at
         # offset 0 when head_size supports it; batch/prefill use CPU path.
         ondevice_overwrite_ok = self.head_size % ONDEVICE_KV_WRITE_HEAD_SIZE_MULTIPLE == 0
