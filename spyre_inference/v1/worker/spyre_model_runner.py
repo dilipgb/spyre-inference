@@ -565,14 +565,17 @@ class TorchSpyreModelRunner(GPUModelRunner):
             spec = spec_by_layer[kv_cache_tensor.shared_by[0]]
             num_blocks = kv_cache_tensor.size // spec.page_size_bytes
 
-            # Default stickification splits head_size into 64-element sticks.
-            # Alternative: stickify block_size or num_kv_heads for different
-            # access patterns (would require explicit SpyreTensorLayout).
+            # Pad head_size to a multiple of 128 (double stick = 256 bytes) so
+            # every page tensor [num_kv_heads, block_size, padded_head_size]
+            # is 100% stick-aligned on Spyre. This eliminates copy_from_d2d
+            # Mod(d, 32) stick hierarchy errors for head_size=64 and allows
+            # 100% on-device D2D operations.
+            padded_head_size = ((spec.head_size + 127) // 128) * 128
             k_pages: list[torch.Tensor] = [
                 torch.zeros(
                     spec.num_kv_heads,
                     spec.block_size,
-                    spec.head_size,
+                    padded_head_size,
                     dtype=torch.float16,
                     device=self._spyre_device,
                 )
@@ -582,7 +585,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 torch.zeros(
                     spec.num_kv_heads,
                     spec.block_size,
-                    spec.head_size,
+                    padded_head_size,
                     dtype=torch.float16,
                     device=self._spyre_device,
                 )
