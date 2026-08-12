@@ -236,13 +236,9 @@ def _create_compilable_reshape_and_cache(num_tokens: int, ondevice_write: bool):
     """Create a reshape_and_cache with fixed token count for torch.compile.
 
     Dynamo unrolls the loop because num_tokens is a closure constant.
-    Full page writes (start_off == 0 and run_len == block_size) perform direct
-    on-device D2D copies on Spyre regardless of head_size because the full page
-    shape [num_kv_heads, block_size, head_size] is perfectly stick-aligned.
-
-    Partial page writes for head_size=64 (ondevice_write=False) convert the
-    chunk slice to CPU first before transferring H2D, avoiding copy_from_d2d's
-    Mod(d1, 32) stick hierarchy issue for sub-page slices.
+    Groups contiguous page tokens into multi-token chunk writes, zero-padding the
+    trailing head dim to a multiple of 128 (double-stick aligned) when needed.
+    All key/value writes run 100% on-device on Spyre.
     """
 
     def specialized_reshape_and_cache_kernel(
@@ -254,7 +250,8 @@ def _create_compilable_reshape_and_cache(num_tokens: int, ondevice_write: bool):
         block_offsets,
         target_device,
     ):
-        block_size = k_pages[0].shape[1]
+        padded_head_size = k_pages[0].shape[-1]
+        head_size = key.shape[-1]
         t = 0
         while t < num_tokens:
             blk = block_indices[t]
@@ -270,14 +267,13 @@ def _create_compilable_reshape_and_cache(num_tokens: int, ondevice_write: bool):
             k_slice = key[t : t + run_len].transpose(0, 1).contiguous()
             v_slice = value[t : t + run_len].transpose(0, 1).contiguous()
 
-            # Full page write or double-stick head_size: safe on-device D2D write!
-            is_full_page = (start_off == 0) and (run_len == block_size)
-            if not ondevice_write and not is_full_page:
-                k_chunk = convert(convert(k_slice, "cpu"), target_device)
-                v_chunk = convert(convert(v_slice, "cpu"), target_device)
-            else:
-                k_chunk = convert(k_slice, target_device)
-                v_chunk = convert(v_slice, target_device)
+            if padded_head_size > head_size:
+                pad_len = padded_head_size - head_size
+                k_slice = torch.nn.functional.pad(k_slice, (0, pad_len))
+                v_slice = torch.nn.functional.pad(v_slice, (0, pad_len))
+
+            k_chunk = convert(k_slice, target_device)
+            v_chunk = convert(v_slice, target_device)
 
             k_pages[blk].narrow(1, start_off, run_len).copy_(k_chunk)
             v_pages[blk].narrow(1, start_off, run_len).copy_(v_chunk)
@@ -839,21 +835,10 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         num_actual_tokens = attn_metadata.num_actual_tokens
 
         # Step 1: Reshape and cache — write new tokens into pages.
-        # Key and Value stay on-device on Spyre. Full-page writes (prefill)
-        # perform direct on-device D2D copies for both head_size=64 and 128.
-        # Any partial-page slice for head_size=64 is converted to CPU within
-        # the kernel on a per-chunk basis to avoid Mod(d1, 32) stick errors.
+        # KV pages are padded to a multiple of 128 (double-stick = 256 bytes) so
+        # writes run 100% on-device on Spyre without CPU fallbacks or stick errors.
         kv_key = key[:num_actual_tokens]
         kv_val = value[:num_actual_tokens]
-        # Query handling: single-sequence decode can assemble on-device at
-        # offset 0 when head_size supports it; batch/prefill use CPU path.
-        ondevice_overwrite_ok = self.head_size % ONDEVICE_KV_WRITE_HEAD_SIZE_MULTIPLE == 0
-        needs_query_cpu = (
-            attn_metadata.max_query_len > 1
-            or attn_metadata.num_seqs > 1
-            or not ondevice_overwrite_ok
-        )
-        query_cpu = convert(query, "cpu") if needs_query_cpu else None
         self._reshape_and_cache(
             kv_key,
             kv_val,
@@ -865,12 +850,10 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         )
 
         # Step 2: Online softmax attention over pages (varlen).
-        # Pass on-device query for single-sequence decode (assembled at offset 0
-        # without a CPU round-trip); everything else goes through query_cpu.
-        query_dev = convert(query, _target_device) if not needs_query_cpu else None
+        # Query stays on-device on Spyre.
+        query_dev = convert(query[:num_actual_tokens], _target_device)
         output = self._online_softmax_attention(
             query_dev,
-            query_cpu[:num_actual_tokens] if query_cpu is not None else None,
             k_pages,
             v_pages,
             attn_metadata,
@@ -935,11 +918,12 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         decode / prefill build it on CPU and transfer.
 
         Args:
-            query_dev: Query on target device (for single-seq decode), or None.
-            query_cpu: Query on CPU (for batch/prefill), or None.
+            query: Query on target device.
         """
         num_heads = self.num_heads
         head_size = self.head_size
+        padded_head_size = k_pages[0].shape[-1]
+        pad_len = padded_head_size - head_size
         num_kv_heads = self.num_kv_heads
         num_queries_per_kv = self.num_queries_per_kv
         block_size = attn_metadata.block_size
@@ -955,53 +939,30 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         )
 
         for seq_idx in range(num_seqs):
-            # Most-naive implementation: no parallelization
-            # over sequences or GQA optimization
             q_start = int(query_start_loc[seq_idx].item())
             q_end = int(query_start_loc[seq_idx + 1].item())
             query_len = q_end - q_start
             kv_len = int(seq_lens[seq_idx].item())
 
-            if query_dev is not None and query_len == 1:
-                # Single-sequence decode: assemble the padded 4D query on device.
-                # The one real token is written at offset 0 (a safe Spyre write);
-                # padded query rows are masked out and dropped from the result.
-                # Layout matches the CPU path: [KV, QPK, aligned_max_query_len, D].
-                q_row = query_dev.unbind(dim=0)[q_start].reshape(
-                    num_kv_heads, num_queries_per_kv, 1, head_size
+            q_seq = query[q_start:q_end]
+
+            # Pad query to global aligned_max_query_len (uniform for all seqs)
+            if aligned_max_query_len > query_len:
+                q_seq = torch.nn.functional.pad(
+                    q_seq,
+                    (0, 0, 0, 0, 0, aligned_max_query_len - query_len),
+                    mode="constant",
+                    value=0.0,
                 )
-                if aligned_max_query_len > 1:
-                    q = torch.zeros(
-                        num_kv_heads,
-                        num_queries_per_kv,
-                        aligned_max_query_len,
-                        head_size,
-                        dtype=q_row.dtype,
-                        device=q_row.device,
-                    )
-                    _overwrite(q_row, q, [2], [0])
-                else:
-                    q = q_row
-                q_dev = q
-            else:
-                # Batch decode / prefill: build on CPU, transfer to device.
-                assert query_cpu is not None
-                q_seq = query_cpu[q_start:q_end]
 
-                # Pad query to global aligned_max_query_len (uniform for all seqs)
-                if aligned_max_query_len > query_len:
-                    q_seq = torch.nn.functional.pad(
-                        q_seq,
-                        (0, 0, 0, 0, 0, aligned_max_query_len - query_len),
-                        mode="constant",
-                        value=0.0,
-                    )
+            if pad_len > 0:
+                q_seq = torch.nn.functional.pad(q_seq, (0, pad_len))
 
-                # Reshape: [padded_query_len, num_heads, head_size]
-                #   → [num_kv_heads, num_queries_per_kv, padded_query_len, head_size]
-                q = q_seq.unsqueeze(0).transpose(1, 2).contiguous()
-                q = q.reshape(num_kv_heads, num_queries_per_kv, aligned_max_query_len, head_size)
-                q_dev = convert(q, device=_target_device)
+            # Reshape: [padded_query_len, num_heads, padded_head_size]
+            #   → [num_kv_heads, num_queries_per_kv, padded_query_len, padded_head_size]
+            q_dev = q_seq.unsqueeze(0).transpose(1, 2).contiguous()
+            q_dev = q_dev.reshape(num_kv_heads, num_queries_per_kv, aligned_max_query_len, padded_head_size)
+            q_dev = convert(q_dev, device=_target_device)
 
             num_blocks_needed = (kv_len + block_size - 1) // block_size
             page_indices = [int(block_table[seq_idx, i]) for i in range(num_blocks_needed)]
@@ -1054,8 +1015,8 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             # the slice-assign into `output` both run on-device; q_start is a
             # Python int, so the dim-0 write offset is a concrete constant.
             result = convert(result, dtype=output.dtype)
-            result = result.reshape(1, num_heads, aligned_max_query_len, head_size)
+            result = result.reshape(1, num_heads, aligned_max_query_len, padded_head_size)
             result = result.transpose(1, 2).contiguous()
-            output[q_start:q_end] = result[0, :query_len, :, :]
+            output[q_start:q_end] = result[0, :query_len, :, :head_size]
 
         return output
