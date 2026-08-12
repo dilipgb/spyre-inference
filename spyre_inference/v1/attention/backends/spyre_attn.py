@@ -257,11 +257,27 @@ def _create_compilable_reshape_and_cache(num_tokens: int, ondevice_write: bool):
         block_offsets,
         target_device,
     ):
-        for t in range(num_tokens):
-            k_tok = convert(key[t].unsqueeze(1).contiguous(), target_device)
-            v_tok = convert(value[t].unsqueeze(1).contiguous(), target_device)
-            k_pages[block_indices[t]].narrow(1, block_offsets[t], 1).copy_(k_tok)
-            v_pages[block_indices[t]].narrow(1, block_offsets[t], 1).copy_(v_tok)
+        t = 0
+        while t < num_tokens:
+            blk = block_indices[t]
+            start_off = block_offsets[t]
+            run_len = 1
+            while (
+                t + run_len < num_tokens
+                and block_indices[t + run_len] == blk
+                and block_offsets[t + run_len] == start_off + run_len
+            ):
+                run_len += 1
+
+            k_chunk = convert(
+                key[t : t + run_len].transpose(0, 1).contiguous(), target_device
+            )
+            v_chunk = convert(
+                value[t : t + run_len].transpose(0, 1).contiguous(), target_device
+            )
+            k_pages[blk].narrow(1, start_off, run_len).copy_(k_chunk)
+            v_pages[blk].narrow(1, start_off, run_len).copy_(v_chunk)
+            t += run_len
 
     return specialized_reshape_and_cache_kernel
 
