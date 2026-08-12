@@ -895,8 +895,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
     @_record_function("spyre_attn::online_softmax")
     def _online_softmax_attention(
         self,
-        query_dev: torch.Tensor | None,
-        query_cpu: torch.Tensor | None,
+        query: torch.Tensor,
         k_pages: list[torch.Tensor],
         v_pages: list[torch.Tensor],
         attn_metadata: SpyreAttentionMetadata,
