@@ -82,11 +82,9 @@ KV_LENGTH_ALIGNMENT = 256
 # a smaller alignment (e.g. QUERY_CHUNK_SIZE=1) for single-token decode steps.
 QUERY_CHUNK_SIZE = 32
 
-# Minimum head_size multiple required for D2D narrow().copy_() to produce a
-# stick-aligned expression in torch-spyre's copy_from_d2d.  head_size=64 has a
-# 2-level stick hierarchy that yields Mod(d1, 32) — unsupported.  head_size=128
-# (two sticks per token slice) compiles cleanly.  Models with head_size < 128
-# (e.g. head_size=64 Llama variants) fall back to CPU for the K/V write.
+# Keep the original production path for double-stick-aligned heads.
+# head_size=64 currently hits an unsupported Mod(..., 32) layout in torch-spyre,
+# so only that unsupported configuration uses the isolated CPU fallback.
 ONDEVICE_KV_WRITE_HEAD_SIZE_MULTIPLE = 128
 
 
@@ -233,14 +231,69 @@ def _maybe_compile(fn):
 
 
 def _create_compilable_reshape_and_cache(num_tokens: int, ondevice_write: bool):
-    """Create a reshape_and_cache with fixed token count for torch.compile.
+    """Create the KV-cache writer.
 
-    Dynamo unrolls the loop because num_tokens is a closure constant.
-    Groups contiguous page tokens into multi-token chunk writes, zero-padding the
-    trailing head dim to a multiple of 128 (double-stick aligned) when needed.
-    All key/value writes run 100% on-device on Spyre.
+    Production path (head_size >= 128 / double-stick aligned):
+        Keep the original kernel exactly as it was. In particular, do not put
+        the head_size=64 workaround inside the compiled graph.
+
+    Head-size=64 path:
+        Uses the existing fallback behavior until torch-spyre supports the
+        required Mod(..., 32) layout expression. This branch is selected once
+        at factory creation time, so the 128 path is not specialized on the
+        64-specific code.
     """
 
+    if ondevice_write:
+        # IMPORTANT: keep this function structurally equivalent to the original
+        # production kernel. Do not add a head-size branch inside it.
+        def specialized_reshape_and_cache_kernel(
+            key,
+            value,
+            k_pages,
+            v_pages,
+            block_indices,
+            block_offsets,
+            target_device,
+        ):
+            padded_head_size = k_pages[0].shape[-1]
+            head_size = key.shape[-1]
+            t = 0
+            while t < num_tokens:
+                blk = block_indices[t]
+                start_off = block_offsets[t]
+                run_len = 1
+                while (
+                    t + run_len < num_tokens
+                    and block_indices[t + run_len] == blk
+                    and block_offsets[t + run_len] == start_off + run_len
+                ):
+                    run_len += 1
+
+                k_slice = key[t : t + run_len].transpose(0, 1).contiguous()
+                v_slice = value[t : t + run_len].transpose(0, 1).contiguous()
+
+                if padded_head_size > head_size:
+                    pad_len = padded_head_size - head_size
+                    k_slice = torch.nn.functional.pad(k_slice, (0, pad_len))
+                    v_slice = torch.nn.functional.pad(v_slice, (0, pad_len))
+
+                k_chunk = convert(k_slice, target_device)
+                v_chunk = convert(v_slice, target_device)
+
+                k_pages[blk].narrow(1, start_off, run_len).copy_(k_chunk)
+                v_pages[blk].narrow(1, start_off, run_len).copy_(v_chunk)
+                t += run_len
+
+        return specialized_reshape_and_cache_kernel
+
+    # ------------------------------------------------------------------
+    # head_size < 128
+    # ------------------------------------------------------------------
+    # CPU fallback for currently unsupported Spyre layouts (notably
+    # head_size=64). This branch is completely isolated from the 128+
+    # production kernel above, so it does not add a head-size branch to that
+    # compiled graph.
     def specialized_reshape_and_cache_kernel(
         key,
         value,
@@ -251,12 +304,13 @@ def _create_compilable_reshape_and_cache(num_tokens: int, ondevice_write: bool):
         target_device,
     ):
         padded_head_size = k_pages[0].shape[-1]
-        head_size = key.shape[-1]
         t = 0
+
         while t < num_tokens:
             blk = block_indices[t]
             start_off = block_offsets[t]
             run_len = 1
+
             while (
                 t + run_len < num_tokens
                 and block_indices[t + run_len] == blk
@@ -264,11 +318,16 @@ def _create_compilable_reshape_and_cache(num_tokens: int, ondevice_write: bool):
             ):
                 run_len += 1
 
-            k_slice = key[t : t + run_len].transpose(0, 1).contiguous()
-            v_slice = value[t : t + run_len].transpose(0, 1).contiguous()
+            # Explicit CPU staging. This intentionally avoids all Spyre D2D
+            # layout compilation for the unsupported head size.
+            k_cpu = key[t : t + run_len].to(device="cpu")
+            v_cpu = value[t : t + run_len].to(device="cpu")
 
-            if padded_head_size > head_size:
-                pad_len = padded_head_size - head_size
+            k_slice = k_cpu.transpose(0, 1).contiguous()
+            v_slice = v_cpu.transpose(0, 1).contiguous()
+
+            if padded_head_size > k_slice.shape[-1]:
+                pad_len = padded_head_size - k_slice.shape[-1]
                 k_slice = torch.nn.functional.pad(k_slice, (0, pad_len))
                 v_slice = torch.nn.functional.pad(v_slice, (0, pad_len))
 
@@ -277,6 +336,7 @@ def _create_compilable_reshape_and_cache(num_tokens: int, ondevice_write: bool):
 
             k_pages[blk].narrow(1, start_off, run_len).copy_(k_chunk)
             v_pages[blk].narrow(1, start_off, run_len).copy_(v_chunk)
+
             t += run_len
 
     return specialized_reshape_and_cache_kernel
@@ -769,7 +829,9 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         self.logits_soft_cap: float = 0.0 if logits_soft_cap is None else float(logits_soft_cap)
 
         # Compiled function caches (keyed by iteration count for reshape, and
-        # by (num_blocks, padded_query_len) for the per-page attention loop)
+        # by (num_blocks, padded_query_len) for the per-page attention loop).
+        # head_size=64 uses the isolated CPU fallback in the reshape factory;
+        # the 128+ path remains the original production implementation.
         # Whether D2D narrow().copy_() is safe for this model's head_size.
         # head_size must be a multiple of 128 (double stick) for copy_from_d2d
         # to produce a valid stick expression. head_size=64 falls back to CPU.
