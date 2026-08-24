@@ -26,7 +26,6 @@ The plugin registers via three entry points:
 |---|---|---|
 | `vllm.platform_plugins` | `spyre_inference:register` | Registers `TorchSpyrePlatform` — sets dtype, worker class, attention backend, and distributed backend |
 | `vllm.general_plugins` | `spyre_inference:register_ops` | Calls `register_all()` — importing the ops package triggers every `@register_oot()` layer swap, and `register_all()` additionally registers the `spyre_convert` and `spyre_vocab_mask` custom ops (RoPE registers no op — its rotation runs in-graph) |
-| `vllm.general_plugins` | `spyre_inference:register_hf_adapters` | Overrides vLLM's `TransformersForCausalLM` with `HfAdaptersForCausalLM` so `model_impl="transformers"` uses hf-adapters (matmul-based RoPE) on Spyre |
 
 `vLLM` is built from source with `VLLM_TARGET_DEVICE=empty` (no device-specific C
 kernels), so the platform overrides a few CPU-backend assumptions: `import_kernels()` is
@@ -226,17 +225,6 @@ Hidden states flow on Spyre between decoder layers, with CPU round-trips only fo
 operations that Spyre doesn't yet support natively (the per-sequence
 attention varlen loop, logits indexing). RoPE's rotation-cache gather and the embedding
 gather both run on-device now, so neither is among them.
-
-## HF-adapters Transformers backend
-
-When `model_impl="transformers"`, the `register_hf_adapters` general plugin swaps vLLM's
-`TransformersForCausalLM` for `HfAdaptersForCausalLM` (`spyre_inference/hf_adapters.py`).
-vLLM's stock Transformers backend still handles model creation, weight loading, attention
-routing, the KV cache, and scheduling; the Spyre OOT layers above apply automatically at
-instantiation. The adapter's main job is to replace HF's `RotaryEmbedding` with a
-matmul-based RoPE (`apply_rope_matmul`), padding Q/K into a stick-aligned dimension for
-the rotation when `head_dim/2` is not a multiple of the Spyre block size and contracting
-back afterward.
 
 ## Distributed (TP)
 
