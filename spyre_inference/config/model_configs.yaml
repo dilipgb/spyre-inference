@@ -1,0 +1,137 @@
+# Model Registry for Spyre Inference
+#
+# Each model entry contains:
+# - architecture: fingerprint fields from the HuggingFace config for identity
+#   verification.  Use YAML anchors (*ref) or inline mappings.
+# - continuous_batching_configs: list of supported serving configurations.
+#   Each entry specifies tp_size, max_model_len, max_num_seqs, and an optional
+#   device_config with Spyre-specific env vars and KV-cache overrides.
+
+# ---------------------------------------------------------------------------
+# Reusable templates (YAML anchors)
+# ---------------------------------------------------------------------------
+_templates:
+
+  # ---- architectures -------------------------------------------------------
+
+  gemma4_26b_architecture: &gemma4_26b_architecture
+    model_type: gemma4
+    text_config:
+      model_type: gemma4_text
+      num_hidden_layers: 30
+      max_position_embeddings: 262144
+      hidden_size: 2816
+      vocab_size: 262144
+      num_attention_heads: 16
+      num_key_value_heads: 8
+      num_global_key_value_heads: 2
+      num_experts: 128
+      top_k_experts: 8
+      head_dim: 256
+      global_head_dim: 512
+      moe_intermediate_size: 704
+      intermediate_size: 2112
+    vision_config:
+      model_type: gemma4_vision
+      num_hidden_layers: 27
+      hidden_size: 1152
+      num_attention_heads: 16
+
+  # ---- device configs (Spyre-specific env vars + KV cache) ----------------
+
+  tp4_device_config: &tp4_device_config
+    env_vars:
+      FLEX_HDMA_P2PSIZE: 268435456    # 256 MB peer-to-peer DMA window
+      FLEX_HDMA_COLLSIZE: 33554432    # 32 MB collective buffer
+
+
+# ---------------------------------------------------------------------------
+# Model registry
+# ---------------------------------------------------------------------------
+models:
+
+  # ---- Gemma 4 26B-A4B Instruct (MoE + vision) ----------------------------
+  # MoE notes:
+  #   - routing:    full_softmax (softmax over all 128 experts, then top-8 selected)
+  #   - activation: gelu_tanh (GELU with tanh approximation)
+  #   - expert scale folded into down-projection at load time (_fold_gemma4_expert_scale)
+  #   - TP shards the intermediate dim of each expert; ep_size/dp_size must be 1
+  #   - intermediate_size (2112) is NOT stick-aligned at TP=1; TP=4 shard 528
+  #     lands on a 64-element stick boundary — TP=1 is therefore unsupported
+  #   - hidden_size (2816) is stick-aligned for fp16 (128-byte / 2 = 64 elements)
+  #   - text backbone loaded via Gemma4ForCausalLM (force_text_backbone strips vision)
+  #   - sliding-window layers: window=1024; full-attention layers every 6th layer
+  google/gemma-4-26B-A4B-it:
+    architecture: *gemma4_26b_architecture
+    continuous_batching_configs:
+      - tp_size: 4
+        max_model_len: 32768
+        max_num_seqs: 32
+        device_config: *tp4_device_config
+
+  # ---- Encoder / Embedding models (TP=1, pooling) -------------------------
+
+  # Semantic similarity — embedding dim 384, supported on both stacks
+  sentence-transformers/all-MiniLM-L6-v2:
+    architecture:
+      model_type: bert
+      num_hidden_layers: 6
+      hidden_size: 384
+      vocab_size: 30522
+      max_position_embeddings: 512
+    continuous_batching_configs:
+      - tp_size: 1
+        max_model_len: 512
+        max_num_seqs: 256
+
+  # Multilingual RAG — embedding dim 768
+  ibm-granite/granite-embedding-278m-multilingual:
+    architecture:
+      model_type: xlm-roberta
+      num_hidden_layers: 12
+      hidden_size: 768
+      vocab_size: 250002
+      max_position_embeddings: 514
+    continuous_batching_configs:
+      - tp_size: 1
+        max_model_len: 512
+        max_num_seqs: 256
+
+  # NLI / zero-shot classification — embedding dim 1024
+  FacebookAI/roberta-large-mnli:
+    architecture:
+      model_type: roberta
+      num_hidden_layers: 24
+      hidden_size: 1024
+      vocab_size: 50265
+      max_position_embeddings: 514
+    continuous_batching_configs:
+      - tp_size: 1
+        max_model_len: 512
+        max_num_seqs: 128
+
+  # Token classification / NER — embedding dim 768 (BERT-base)
+  dslim/bert-base-NER:
+    architecture:
+      model_type: bert
+      num_hidden_layers: 12
+      hidden_size: 768
+      vocab_size: 28996
+      max_position_embeddings: 512
+    continuous_batching_configs:
+      - tp_size: 1
+        max_model_len: 512
+        max_num_seqs: 256
+
+  # Token classification / NER — embedding dim 1024 (RoBERTa-large)
+  Jean-Baptiste/roberta-large-ner-english:
+    architecture:
+      model_type: roberta
+      num_hidden_layers: 24
+      hidden_size: 1024
+      vocab_size: 50265
+      max_position_embeddings: 514
+    continuous_batching_configs:
+      - tp_size: 1
+        max_model_len: 512
+        max_num_seqs: 128
