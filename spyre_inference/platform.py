@@ -552,26 +552,28 @@ class TorchSpyrePlatform(CpuPlatform):
 
     @classmethod
     def _warn_if_not_in_registry(cls, vllm_config: VllmConfig) -> None:
-        """Warn when the requested model/tp/max_model_len is not in the Spyre registry.
+        """Warn when the requested model/tp/max_model_len/platform is not in the registry.
 
         The registry is not exhaustive — unknown models may still work — so this
         is a warning, not an error.
         """
-        from spyre_inference.config import lookup_config
+        from spyre_inference.config import current_platform, lookup_config
 
         model_id = vllm_config.model_config.model
         tp_size = vllm_config.parallel_config.tensor_parallel_size
         max_model_len = vllm_config.model_config.max_model_len
+        machine = current_platform()
 
-        cfg = lookup_config(model_id, tp_size=tp_size, max_model_len=max_model_len)
+        cfg = lookup_config(model_id, tp_size=tp_size, max_model_len=max_model_len, machine=machine)
         if cfg is None:
             logger.warning(
-                "Model %r with tp_size=%d max_model_len=%d is not in the Spyre model "
-                "registry. The run may still succeed, but this configuration has not "
-                "been validated.",
+                "Model %r with tp_size=%d max_model_len=%d platform=%s is not in the "
+                "Spyre model registry. The run may still succeed, but this "
+                "configuration has not been validated.",
                 model_id,
                 tp_size,
                 max_model_len,
+                machine,
             )
 
     @classmethod

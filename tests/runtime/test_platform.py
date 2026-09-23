@@ -17,6 +17,7 @@
 import math
 import os
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -648,17 +649,18 @@ def test_configure_threading_raises_when_undetectable(monkeypatch):
 @pytest.mark.parametrize(
     ("model", "tp_size", "max_model_len", "expect_warn"),
     [
-        # In the registry — no warning.
-        ("dslim/bert-base-NER", 1, 512, False),
-        # Real HF model, not in the Spyre registry — warning must fire.
-        ("Qwen/Qwen3-0.6B", 1, 512, True),
-        # Registered model requested at wrong tp/len — still warns.
-        ("dslim/bert-base-NER", 1, 1024, True),
+        # Exact registry hit (gemma-3-1b-it, tp=1, len=32768) — no warning.
+        ("google/gemma-3-1b-it", 1, 32768, False),
+        # Same model, wrong max_model_len — not a registered config, warns.
+        ("google/gemma-3-1b-it", 1, 4096, True),
+        # Same model, wrong tp_size — not a registered config, warns.
+        ("google/gemma-3-1b-it", 2, 32768, True),
     ],
 )
 def test_registry_check_via_platform(model, tp_size, max_model_len, expect_warn, caplog):
     """Full platform boot: check_and_update_config fires _warn_if_not_in_registry.
-    Uses a real VllmConfig so the plugin activates and the log line is emitted."""
+    Uses a real VllmConfig (gemma-3-1b-it, cached on CI) so the plugin activates
+    and the log line is emitted for miss cases, and is absent for hit cases."""
     import logging
     from vllm.config import ParallelConfig
 
@@ -679,7 +681,10 @@ def test_registry_check_via_platform(model, tp_size, max_model_len, expect_warn,
 
     with caplog.at_level(logging.WARNING, logger="spyre_inference.platform"):
         caplog.clear()
-        TorchSpyrePlatform.check_and_update_config(vllm_config)
+        # Pin machine to "ci" so the platform check is deterministic on any host.
+        # gemma-3-1b-it has platforms=[ci], so "ci" is the hit; any other value misses.
+        with patch("spyre_inference.config.current_platform", return_value="ci"):
+            TorchSpyrePlatform.check_and_update_config(vllm_config)
 
     registry_warnings = [r for r in caplog.records if "not in the Spyre model registry" in r.message]
     if expect_warn:

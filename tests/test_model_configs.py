@@ -56,6 +56,7 @@ def test_all_cb_configs_are_typed():
 @pytest.mark.parametrize(
     "model_id",
     [
+        "google/gemma-3-1b-it",
         "google/gemma-4-26B-A4B-it",
         "sentence-transformers/all-MiniLM-L6-v2",
         "ibm-granite/granite-embedding-278m-multilingual",
@@ -79,7 +80,6 @@ def test_architecture_is_a_dict():
 def test_architecture_has_model_type():
     for model_id, entry in model_registry().items():
         arch = entry.architecture
-        # model_type may be at top level or inside text_config for VLMs
         has_model_type = "model_type" in arch or (
             isinstance(arch.get("text_config"), dict) and "model_type" in arch["text_config"]
         )
@@ -119,12 +119,29 @@ def test_num_gpu_blocks_override_is_positive_or_none():
                 )
 
 
+def test_platforms_field_is_list_or_none():
+    for model_id, entry in model_registry().items():
+        assert entry.platforms is None or isinstance(entry.platforms, list), (
+            f"{model_id}: platforms must be a list or None"
+        )
+
+
+def test_platforms_contain_only_valid_values():
+    from spyre_inference.config import _VALID_PLATFORMS
+
+    for model_id, entry in model_registry().items():
+        if entry.platforms is None:
+            continue
+        invalid = set(entry.platforms) - _VALID_PLATFORMS
+        assert not invalid, f"{model_id}: unknown platform(s) {invalid}"
+
+
 def test_lookup_config_returns_matching_entry():
-    cfg = lookup_config("google/gemma-4-26B-A4B-it", tp_size=4, max_model_len=32768)
+    # gemma-3-1b-it has platforms=[ci]; on CI current_platform() returns "ci".
+    cfg = lookup_config("google/gemma-3-1b-it", tp_size=1, max_model_len=32768)
     assert cfg is not None
-    assert cfg.tp_size == 4
+    assert cfg.tp_size == 1
     assert cfg.max_model_len == 32768
-    assert cfg.device_config.env_vars.get("FLEX_HDMA_P2PSIZE") == 268435456
 
 
 def test_lookup_config_returns_none_for_missing_model():
@@ -132,12 +149,10 @@ def test_lookup_config_returns_none_for_missing_model():
 
 
 def test_lookup_config_returns_none_for_missing_combination():
-    # Gemma-4 only has a TP=4 config; TP=1 doesn't exist.
-    assert lookup_config("google/gemma-4-26B-A4B-it", tp_size=1, max_model_len=32768) is None
+    # Registered model but wrong tp_size — no match.
+    assert lookup_config("google/gemma-3-1b-it", tp_size=4, max_model_len=32768) is None
 
 
 def test_registry_is_cached():
     """model_registry() must return the same dict object on repeated calls."""
     assert model_registry() is model_registry()
-
-
