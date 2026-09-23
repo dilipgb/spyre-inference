@@ -670,7 +670,7 @@ def test_registry_check_via_platform(model, tp_size, max_model_len, expect_warn,
         model_config=ModelConfig(
             model=model,
             max_model_len=max_model_len,
-            dtype=torch.float16,
+            dtype="auto",
             trust_remote_code=True,
             enforce_eager=True,
         ),
@@ -681,10 +681,7 @@ def test_registry_check_via_platform(model, tp_size, max_model_len, expect_warn,
 
     with caplog.at_level(logging.WARNING, logger="spyre_inference.platform"):
         caplog.clear()
-        # Pin machine to "ci" so the platform check is deterministic on any host.
-        # gemma-3-1b-it has platforms=[ci], so "ci" is the hit; any other value misses.
-        with patch("spyre_inference.config.current_platform", return_value="ci"):
-            TorchSpyrePlatform.check_and_update_config(vllm_config)
+        TorchSpyrePlatform.check_and_update_config(vllm_config)
 
     registry_warnings = [r for r in caplog.records if "not in the Spyre model registry" in r.message]
     if expect_warn:
