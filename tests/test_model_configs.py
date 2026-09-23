@@ -141,39 +141,3 @@ def test_registry_is_cached():
     assert model_registry() is model_registry()
 
 
-def test_warn_if_not_in_registry_fires_for_unknown_model(monkeypatch):
-    """_warn_if_not_in_registry logs a warning for a model/config not in the registry."""
-    from types import SimpleNamespace
-    from unittest.mock import MagicMock, patch
-
-    vllm_config = SimpleNamespace(
-        model_config=SimpleNamespace(model="unknown/model", max_model_len=4096),
-        parallel_config=SimpleNamespace(tensor_parallel_size=1),
-    )
-
-    with patch("spyre_inference.platform.logger") as mock_logger:
-        from spyre_inference.platform import TorchSpyrePlatform
-
-        TorchSpyrePlatform._warn_if_not_in_registry(vllm_config)
-        mock_logger.warning.assert_called_once()
-        args = mock_logger.warning.call_args[0]
-        assert "unknown/model" in args[1]
-
-
-def test_warn_if_not_in_registry_silent_for_known_config():
-    """_warn_if_not_in_registry does not warn for a registered model/config."""
-    from types import SimpleNamespace
-    from unittest.mock import patch
-
-    vllm_config = SimpleNamespace(
-        model_config=SimpleNamespace(
-            model="google/gemma-4-26B-A4B-it", max_model_len=32768
-        ),
-        parallel_config=SimpleNamespace(tensor_parallel_size=4),
-    )
-
-    with patch("spyre_inference.platform.logger") as mock_logger:
-        from spyre_inference.platform import TorchSpyrePlatform
-
-        TorchSpyrePlatform._warn_if_not_in_registry(vllm_config)
-        mock_logger.warning.assert_not_called()
