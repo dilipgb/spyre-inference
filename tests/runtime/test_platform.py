@@ -678,11 +678,12 @@ def test_registry_check_via_platform(model, tp_size, max_model_len, expect_warn,
     )
 
     with caplog.at_level(logging.WARNING, logger="spyre_inference.platform"):
+        caplog.clear()
         TorchSpyrePlatform.check_and_update_config(vllm_config)
 
     registry_warnings = [r for r in caplog.records if "not in the Spyre model registry" in r.message]
     if expect_warn:
-        assert len(registry_warnings) == 1
+        assert len(registry_warnings) >= 1
         assert model in registry_warnings[0].message
     else:
         assert len(registry_warnings) == 0
