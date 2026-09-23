@@ -642,53 +642,48 @@ def test_configure_threading_raises_when_undetectable(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Registry check — _warn_if_not_in_registry wired through check_and_update_config
+# Registry check — end-to-end through check_and_update_config + platform boot
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize(
     ("model", "tp_size", "max_model_len", "expect_warn"),
     [
-        # Registered — exact hit on all three axes, no warning.
-        ("google/gemma-4-26B-A4B-it", 4, 32768, False),
-        # Real HF model but not in the Spyre registry.
-        ("ibm-granite/granite-3.3-8b-instruct", 1, 4096, True),
-        # Registered model, wrong tp_size (gemma-4 only has TP=4).
-        ("google/gemma-4-26B-A4B-it", 1, 32768, True),
-        # Registered model, wrong max_model_len.
-        ("google/gemma-4-26B-A4B-it", 4, 65536, True),
+        # In the registry — no warning.
+        ("dslim/bert-base-NER", 1, 512, False),
+        # Real HF model, not in the Spyre registry — warning must fire.
+        ("Qwen/Qwen3-0.6B", 1, 512, True),
+        # Registered model requested at wrong tp/len — still warns.
+        ("dslim/bert-base-NER", 1, 1024, True),
     ],
 )
-def test_registry_check(model, tp_size, max_model_len, expect_warn):
-    """_warn_if_not_in_registry warns iff the model/tp/max_model_len triple is
-    not in the registry.  No HF download: all cases use a SimpleNamespace stub."""
-    from types import SimpleNamespace
-    from unittest.mock import patch
+def test_registry_check_via_platform(model, tp_size, max_model_len, expect_warn, caplog):
+    """Full platform boot: check_and_update_config fires _warn_if_not_in_registry.
+    Uses a real VllmConfig so the plugin activates and the log line is emitted."""
+    import logging
+    from vllm.config import ParallelConfig
 
     from spyre_inference.platform import TorchSpyrePlatform
 
-    vllm_config = SimpleNamespace(
-        model_config=SimpleNamespace(model=model, max_model_len=max_model_len),
-        parallel_config=SimpleNamespace(tensor_parallel_size=tp_size),
+    vllm_config = VllmConfig(
+        model_config=ModelConfig(
+            model=model,
+            max_model_len=max_model_len,
+            dtype=torch.float16,
+            trust_remote_code=True,
+            enforce_eager=True,
+        ),
+        cache_config=CacheConfig(block_size=128),
+        compilation_config=CompilationConfig(custom_ops=["all"]),
+        parallel_config=ParallelConfig(tensor_parallel_size=tp_size),
     )
 
-    with patch("spyre_inference.platform.logger") as mock_logger:
-        TorchSpyrePlatform._warn_if_not_in_registry(vllm_config)
-        if expect_warn:
-            mock_logger.warning.assert_called_once()
-            assert model in mock_logger.warning.call_args[0][1]
-        else:
-            mock_logger.warning.assert_not_called()
-
-
-def test_registry_check_wired_into_check_and_update_config():
-    """check_and_update_config calls _warn_if_not_in_registry — proves the wiring."""
-    from unittest.mock import patch
-
-    from spyre_inference.platform import TorchSpyrePlatform
-
-    vllm_config = _defaults_config(enforce_eager=True, mode=None)
-
-    with patch.object(TorchSpyrePlatform, "_warn_if_not_in_registry") as mock_warn:
+    with caplog.at_level(logging.WARNING, logger="spyre_inference.platform"):
         TorchSpyrePlatform.check_and_update_config(vllm_config)
-        mock_warn.assert_called_once_with(vllm_config)
+
+    registry_warnings = [r for r in caplog.records if "not in the Spyre model registry" in r.message]
+    if expect_warn:
+        assert len(registry_warnings) == 1
+        assert model in registry_warnings[0].message
+    else:
+        assert len(registry_warnings) == 0
 
