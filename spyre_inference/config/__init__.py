@@ -33,24 +33,16 @@ from typing import Any
 _YAML_PATH = Path(__file__).with_name("model_configs.yaml")
 
 # Canonical platform strings used in the registry.
-# ``ci`` matches any host where the CI=true environment variable is set
-# (GitHub Actions, Jenkins, and most CI systems set this automatically).
-_VALID_PLATFORMS = frozenset({"x86_64", "s390x", "ppc64le", "ci"})
+_VALID_PLATFORMS = frozenset({"x86_64", "s390x", "ppc64le"})
 
 
 def current_platform() -> str:
-    """Return the normalised platform token for registry platform checks.
+    """Return the normalised machine architecture for registry platform checks.
 
-    Returns ``"ci"`` when the ``CI`` environment variable is set (truthy),
-    which is the case on GitHub Actions, Jenkins, and most CI systems.
-    Otherwise maps ``platform.machine()`` to the registry's canonical names:
+    Maps ``platform.machine()`` to the registry's canonical names:
     ``x86_64``, ``s390x``, or ``ppc64le``.  Unknown architectures are
     returned as-is so they never match a restricted platform list.
     """
-    import os
-
-    if os.environ.get("CI"):
-        return "ci"
     machine = platform.machine()
     _aliases = {"amd64": "x86_64", "x86": "x86_64", "s390": "s390x"}
     return _aliases.get(machine.lower(), machine)
