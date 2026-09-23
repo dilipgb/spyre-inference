@@ -17,7 +17,6 @@
 import math
 import os
 from types import SimpleNamespace
-from unittest.mock import patch
 
 import pytest
 import torch
@@ -646,6 +645,7 @@ def test_configure_threading_raises_when_undetectable(monkeypatch):
 # Registry check — end-to-end through check_and_update_config + platform boot
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.parametrize(
     ("model", "tp_size", "max_model_len", "expect_warn"),
     [
@@ -662,6 +662,7 @@ def test_registry_check_via_platform(model, tp_size, max_model_len, expect_warn,
     Uses a real VllmConfig (gemma-3-1b-it, cached on CI) so the plugin activates
     and the log line is emitted for miss cases, and is absent for hit cases."""
     import logging
+
     from vllm.config import ParallelConfig
 
     from spyre_inference.platform import TorchSpyrePlatform
@@ -683,10 +684,11 @@ def test_registry_check_via_platform(model, tp_size, max_model_len, expect_warn,
         caplog.clear()
         TorchSpyrePlatform.check_and_update_config(vllm_config)
 
-    registry_warnings = [r for r in caplog.records if "not in the Spyre model registry" in r.message]
+    registry_warnings = [
+        r for r in caplog.records if "not in the Spyre model registry" in r.message
+    ]
     if expect_warn:
         assert len(registry_warnings) >= 1
         assert model in registry_warnings[0].message
     else:
         assert len(registry_warnings) == 0
-

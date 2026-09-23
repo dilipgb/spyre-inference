@@ -39,9 +39,7 @@ def test_every_entry_is_a_model_entry():
 
 def test_every_entry_has_at_least_one_cb_config():
     for model_id, entry in model_registry().items():
-        assert entry.continuous_batching_configs, (
-            f"{model_id} has no continuous_batching_configs"
-        )
+        assert entry.continuous_batching_configs, f"{model_id} has no continuous_batching_configs"
 
 
 def test_all_cb_configs_are_typed():

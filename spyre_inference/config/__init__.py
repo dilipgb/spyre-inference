@@ -124,8 +124,7 @@ def model_registry() -> dict[str, ModelEntry]:
     raw: dict[str, Any] = yaml.safe_load(_YAML_PATH.read_text())
     models_raw: dict[str, Any] = raw.get("models") or {}
     return {
-        model_id: ModelEntry.from_dict(model_id, entry)
-        for model_id, entry in models_raw.items()
+        model_id: ModelEntry.from_dict(model_id, entry) for model_id, entry in models_raw.items()
     }
 
 
