@@ -138,7 +138,6 @@ def test_platforms_contain_only_valid_values():
 
 
 def test_lookup_config_returns_matching_entry():
-    # gemma-3-1b-it has platforms=[ci]; on CI current_platform() returns "ci".
     cfg = lookup_config("google/gemma-3-1b-it", tp_size=1, max_model_len=32768)
     assert cfg is not None
     assert cfg.tp_size == 1
@@ -150,7 +149,6 @@ def test_lookup_config_returns_none_for_missing_model():
 
 
 def test_lookup_config_returns_none_for_missing_combination():
-    # Registered model but wrong tp_size — no match.
     assert lookup_config("google/gemma-3-1b-it", tp_size=4, max_model_len=32768) is None
 
 
