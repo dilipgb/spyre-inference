@@ -95,7 +95,6 @@ models:
       - tp_size: 4
         max_model_len: 32768
         max_num_seqs: 32
-        device_config: *tp4_device_config
 
   # ---- Granite 4.1 decoder models ------------------------------------------
   ibm-granite/granite-4.1-8b:
@@ -105,7 +104,6 @@ models:
       - tp_size: 4
         max_model_len: 32768
         max_num_seqs: 32
-        device_config: *tp4_device_config
 
   ibm-granite/granite-4.1-8b-fp8:
     architecture:
@@ -117,7 +115,6 @@ models:
       - tp_size: 4
         max_model_len: 32768
         max_num_seqs: 32
-        device_config: *tp4_device_config
 
   # ---- Granite Vision 4.1 4B -----------------------------------------------
   ibm-granite/granite-vision-4.1-4b:
