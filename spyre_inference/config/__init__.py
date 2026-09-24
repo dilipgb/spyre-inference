@@ -32,7 +32,6 @@ from typing import Any
 
 _YAML_PATH = Path(__file__).with_name("model_configs.yaml")
 
-# Canonical platform strings used in the registry.
 _VALID_PLATFORMS = frozenset({"x86_64", "s390x", "ppc64le"})
 
 
@@ -86,7 +85,6 @@ class ModelEntry:
 
     model_id: str
     architecture: dict[str, Any]
-    # None means supported on all platforms.
     platforms: list[str] | None
     continuous_batching_configs: list[ContinuousBatchingConfig]
 

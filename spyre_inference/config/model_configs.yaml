@@ -88,16 +88,6 @@ models:
         max_num_seqs: 32
 
   # ---- Gemma 4 26B-A4B Instruct (MoE + vision) ----------------------------
-  # MoE notes:
-  #   - routing:    full_softmax (softmax over all 128 experts, then top-8 selected)
-  #   - activation: gelu_tanh (GELU with tanh approximation)
-  #   - expert scale folded into down-projection at load time (_fold_gemma4_expert_scale)
-  #   - TP shards the intermediate dim of each expert; ep_size/dp_size must be 1
-  #   - intermediate_size (2112) is NOT stick-aligned at TP=1; TP=4 shard 528
-  #     lands on a 64-element stick boundary — TP=1 is therefore unsupported
-  #   - hidden_size (2816) is stick-aligned for fp16 (128-byte / 2 = 64 elements)
-  #   - text backbone loaded via Gemma4ForCausalLM (force_text_backbone strips vision)
-  #   - sliding-window layers: window=1024; full-attention layers every 6th layer
   google/gemma-4-26B-A4B-it:
     architecture: *gemma4_26b_architecture
     platforms: [x86_64, s390x, ppc64le]
@@ -140,7 +130,6 @@ models:
 
   # ---- Encoder / Embedding models (TP=1, pooling) -------------------------
 
-  # Semantic similarity — embedding dim 384, supported on both stacks
   sentence-transformers/all-MiniLM-L6-v2:
     architecture:
       model_type: bert
