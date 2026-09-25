@@ -1,70 +1,10 @@
 # Model Registry for Spyre Inference
 #
 # Each model entry contains:
-# - architecture: fingerprint fields from the HuggingFace config for identity
-#   verification.  Use YAML anchors (*ref) or inline mappings.
 # - platforms: list of supported CPU architectures.  Omit to support all.
 #   Valid values: x86_64, s390x, ppc64le
 # - continuous_batching_configs: list of supported serving configurations.
-#   Each entry specifies tp_size, max_model_len, max_num_seqs, and an optional
-#   device_config with Spyre-specific env vars and KV-cache overrides.
-
-# ---------------------------------------------------------------------------
-# Reusable templates (YAML anchors)
-# ---------------------------------------------------------------------------
-_templates:
-
-  # ---- architectures -------------------------------------------------------
-
-  granite_41_8b_architecture: &granite_41_8b_architecture
-    model_type: granite
-    num_hidden_layers: 40
-    max_position_embeddings: 131072
-    hidden_size: 4096
-    vocab_size: 100352
-    num_key_value_heads: 8
-    num_attention_heads: 32
-
-  granite_vision_41_4b_architecture: &granite_vision_41_4b_architecture
-    model_type: granite4_vision
-    text_config:
-      model_type: granite
-      num_hidden_layers: 40
-      max_position_embeddings: 131072
-      hidden_size: 2560
-      vocab_size: 100352
-      num_key_value_heads: 8
-      num_attention_heads: 40
-    vision_config:
-      model_type: siglip_vision_model
-      num_hidden_layers: 27
-      hidden_size: 1152
-      num_attention_heads: 16
-
-  gemma4_26b_architecture: &gemma4_26b_architecture
-    model_type: gemma4
-    text_config:
-      model_type: gemma4_text
-      num_hidden_layers: 30
-      max_position_embeddings: 262144
-      hidden_size: 2816
-      vocab_size: 262144
-      num_attention_heads: 16
-      num_key_value_heads: 8
-      num_global_key_value_heads: 2
-      num_experts: 128
-      top_k_experts: 8
-      head_dim: 256
-      global_head_dim: 512
-      moe_intermediate_size: 704
-      intermediate_size: 2112
-    vision_config:
-      model_type: gemma4_vision
-      num_hidden_layers: 27
-      hidden_size: 1152
-      num_attention_heads: 16
-
-
+#   Each entry specifies tp_size, max_model_len, and max_num_seqs.
 
 # ---------------------------------------------------------------------------
 # Model registry
@@ -73,15 +13,6 @@ models:
 
   # ---- Gemma 3 1B Instruct (CI test model, no platform restriction) -------
   google/gemma-3-1b-it:
-    architecture:
-      model_type: gemma3
-      num_hidden_layers: 26
-      max_position_embeddings: 131072
-      hidden_size: 1152
-      vocab_size: 262144
-      num_key_value_heads: 1
-      num_attention_heads: 4
-      head_dim: 256
     continuous_batching_configs:
       - tp_size: 1
         max_model_len: 32768
@@ -89,7 +20,6 @@ models:
 
   # ---- Gemma 4 26B-A4B Instruct (MoE + vision) ----------------------------
   google/gemma-4-26B-A4B-it:
-    architecture: *gemma4_26b_architecture
     platforms: [x86_64, s390x, ppc64le]
     continuous_batching_configs:
       - tp_size: 4
@@ -98,7 +28,6 @@ models:
 
   # ---- Granite 4.1 decoder models ------------------------------------------
   ibm-granite/granite-4.1-8b:
-    architecture: *granite_41_8b_architecture
     platforms: [x86_64, ppc64le]
     continuous_batching_configs:
       - tp_size: 4
@@ -106,34 +35,45 @@ models:
         max_num_seqs: 32
 
   ibm-granite/granite-4.1-8b-fp8:
-    architecture:
-      <<: *granite_41_8b_architecture
-      quantization_config:
-        format: float-quantized
     platforms: [x86_64, ppc64le]
     continuous_batching_configs:
       - tp_size: 4
         max_model_len: 32768
         max_num_seqs: 32
 
-  # ---- Granite Vision 4.1 4B -----------------------------------------------
-  ibm-granite/granite-vision-4.1-4b:
-    architecture: *granite_vision_41_4b_architecture
-    platforms: [x86_64, ppc64le]
-    continuous_batching_configs:
-      - tp_size: 1
-        max_model_len: 8192
-        max_num_seqs: 16
 
   # ---- Encoder / Embedding models (TP=1, pooling) -------------------------
 
   sentence-transformers/all-MiniLM-L6-v2:
-    architecture:
-      model_type: bert
-      num_hidden_layers: 6
-      hidden_size: 384
-      vocab_size: 30522
-      max_position_embeddings: 512
+    platforms: [x86_64, s390x, ppc64le]
+    continuous_batching_configs:
+      - tp_size: 1
+        max_model_len: 512
+        max_num_seqs: 256
+
+  sentence-transformers/all-roberta-large-v1:
+    platforms: [x86_64, s390x, ppc64le]
+    continuous_batching_configs:
+      - tp_size: 1
+        max_model_len: 512
+        max_num_seqs: 128
+
+  sentence-transformers/clip-ViT-B-32:
+    platforms: [x86_64, s390x, ppc64le]
+    continuous_batching_configs:
+      - tp_size: 1
+        max_model_len: 77
+        max_num_seqs: 256
+
+  # Granite embedding models — English
+  ibm-granite/granite-embedding-30m-english:
+    platforms: [x86_64, s390x, ppc64le]
+    continuous_batching_configs:
+      - tp_size: 1
+        max_model_len: 512
+        max_num_seqs: 256
+
+  ibm-granite/granite-embedding-125m-english:
     platforms: [x86_64, s390x, ppc64le]
     continuous_batching_configs:
       - tp_size: 1
@@ -142,26 +82,22 @@ models:
 
   # Multilingual RAG — embedding dim 768
   ibm-granite/granite-embedding-278m-multilingual:
-    architecture:
-      model_type: xlm-roberta
-      num_hidden_layers: 12
-      hidden_size: 768
-      vocab_size: 250002
-      max_position_embeddings: 514
     platforms: [x86_64, s390x, ppc64le]
     continuous_batching_configs:
       - tp_size: 1
         max_model_len: 512
         max_num_seqs: 256
 
+  # Multilingual embedding — XLM-RoBERTa-large backbone
+  intfloat/multilingual-e5-large:
+    platforms: [x86_64, s390x, ppc64le]
+    continuous_batching_configs:
+      - tp_size: 1
+        max_model_len: 512
+        max_num_seqs: 128
+
   # NLI / zero-shot classification — embedding dim 1024
   FacebookAI/roberta-large-mnli:
-    architecture:
-      model_type: roberta
-      num_hidden_layers: 24
-      hidden_size: 1024
-      vocab_size: 50265
-      max_position_embeddings: 514
     platforms: [x86_64, s390x, ppc64le]
     continuous_batching_configs:
       - tp_size: 1
@@ -170,12 +106,6 @@ models:
 
   # Token classification / NER — embedding dim 768 (BERT-base)
   dslim/bert-base-NER:
-    architecture:
-      model_type: bert
-      num_hidden_layers: 12
-      hidden_size: 768
-      vocab_size: 28996
-      max_position_embeddings: 512
     platforms: [x86_64, s390x, ppc64le]
     continuous_batching_configs:
       - tp_size: 1
@@ -184,12 +114,22 @@ models:
 
   # Token classification / NER — embedding dim 1024 (RoBERTa-large)
   Jean-Baptiste/roberta-large-ner-english:
-    architecture:
-      model_type: roberta
-      num_hidden_layers: 24
-      hidden_size: 1024
-      vocab_size: 50265
-      max_position_embeddings: 514
+    platforms: [x86_64, s390x, ppc64le]
+    continuous_batching_configs:
+      - tp_size: 1
+        max_model_len: 512
+        max_num_seqs: 128
+
+  # ---- Cross-encoder / Reranker models ------------------------------------
+
+  BAAI/bge-reranker-large:
+    platforms: [x86_64, s390x, ppc64le]
+    continuous_batching_configs:
+      - tp_size: 1
+        max_model_len: 512
+        max_num_seqs: 128
+
+  BAAI/bge-reranker-v2-m3:
     platforms: [x86_64, s390x, ppc64le]
     continuous_batching_configs:
       - tp_size: 1

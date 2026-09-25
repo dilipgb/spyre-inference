@@ -58,33 +58,22 @@ def test_all_cb_configs_are_typed():
         "google/gemma-4-26B-A4B-it",
         "ibm-granite/granite-4.1-8b",
         "ibm-granite/granite-4.1-8b-fp8",
-        "ibm-granite/granite-vision-4.1-4b",
         "sentence-transformers/all-MiniLM-L6-v2",
+        "sentence-transformers/all-roberta-large-v1",
+        "sentence-transformers/clip-ViT-B-32",
+        "ibm-granite/granite-embedding-30m-english",
+        "ibm-granite/granite-embedding-125m-english",
         "ibm-granite/granite-embedding-278m-multilingual",
+        "intfloat/multilingual-e5-large",
         "FacebookAI/roberta-large-mnli",
         "dslim/bert-base-NER",
         "Jean-Baptiste/roberta-large-ner-english",
+        "BAAI/bge-reranker-large",
+        "BAAI/bge-reranker-v2-m3",
     ],
 )
 def test_known_models_are_present(model_id):
     assert model_id in model_registry(), f"{model_id} missing from registry"
-
-
-def test_architecture_is_a_dict():
-    for model_id, entry in model_registry().items():
-        assert isinstance(entry.architecture, dict), (
-            f"{model_id}: architecture is {type(entry.architecture)}, expected dict"
-        )
-        assert entry.architecture, f"{model_id}: architecture dict is empty"
-
-
-def test_architecture_has_model_type():
-    for model_id, entry in model_registry().items():
-        arch = entry.architecture
-        has_model_type = "model_type" in arch or (
-            isinstance(arch.get("text_config"), dict) and "model_type" in arch["text_config"]
-        )
-        assert has_model_type, f"{model_id}: no model_type in architecture"
 
 
 def test_cb_config_positive_fields():

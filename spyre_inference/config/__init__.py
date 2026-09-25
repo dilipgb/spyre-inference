@@ -81,16 +81,11 @@ class ContinuousBatchingConfig:
 
 @dataclass
 class ModelEntry:
-    """A single registered model with its architecture fingerprint and configs."""
-
     model_id: str
-    architecture: dict[str, Any]
     platforms: list[str] | None
     continuous_batching_configs: list[ContinuousBatchingConfig]
 
     def supports_platform(self, machine: str) -> bool:
-        """True when ``machine`` is in this entry's platform list, or when the
-        entry has no platform restriction (``platforms`` is ``None``)."""
         return self.platforms is None or machine in self.platforms
 
     @classmethod
@@ -102,7 +97,6 @@ class ModelEntry:
         ]
         return cls(
             model_id=model_id,
-            architecture=d.get("architecture") or {},
             platforms=list(raw_platforms) if raw_platforms is not None else None,
             continuous_batching_configs=cb_configs,
         )
