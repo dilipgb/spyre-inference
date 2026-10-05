@@ -20,6 +20,7 @@ from spyre_inference.config import (
     ContinuousBatchingConfig,
     DeviceConfig,
     ModelEntry,
+    StaticBatchingConfig,
     lookup_config,
     model_registry,
 )
@@ -37,15 +38,25 @@ def test_every_entry_is_a_model_entry():
         assert entry.model_id == model_id
 
 
-def test_every_entry_has_at_least_one_cb_config():
+def test_every_entry_has_at_least_one_config():
     for model_id, entry in model_registry().items():
-        assert entry.continuous_batching_configs, f"{model_id} has no continuous_batching_configs"
+        has_config = entry.continuous_batching_configs or entry.static_batching_configs
+        assert has_config, f"{model_id} has no continuous_batching_configs or static_batching_configs"
 
 
 def test_all_cb_configs_are_typed():
     for model_id, entry in model_registry().items():
         for cfg in entry.continuous_batching_configs:
             assert isinstance(cfg, ContinuousBatchingConfig), (
+                f"{model_id}: unexpected type {type(cfg)}"
+            )
+            assert isinstance(cfg.device_config, DeviceConfig)
+
+
+def test_all_sb_configs_are_typed():
+    for model_id, entry in model_registry().items():
+        for cfg in entry.static_batching_configs:
+            assert isinstance(cfg, StaticBatchingConfig), (
                 f"{model_id}: unexpected type {type(cfg)}"
             )
             assert isinstance(cfg.device_config, DeviceConfig)
@@ -77,24 +88,28 @@ def test_known_models_are_present(model_id):
     assert model_id in model_registry(), f"{model_id} missing from registry"
 
 
-def test_cb_config_positive_fields():
+def _all_configs(entry: ModelEntry):
+    return [*entry.continuous_batching_configs, *entry.static_batching_configs]
+
+
+def test_config_positive_fields():
     for model_id, entry in model_registry().items():
-        for cfg in entry.continuous_batching_configs:
+        for cfg in _all_configs(entry):
             assert cfg.tp_size >= 1, f"{model_id}: tp_size < 1"
             assert cfg.max_model_len > 0, f"{model_id}: max_model_len <= 0"
             assert cfg.max_num_seqs > 0, f"{model_id}: max_num_seqs <= 0"
 
 
-def test_cb_config_tp_size_is_power_of_two():
+def test_config_tp_size_is_power_of_two():
     for model_id, entry in model_registry().items():
-        for cfg in entry.continuous_batching_configs:
+        for cfg in _all_configs(entry):
             tp = cfg.tp_size
             assert tp & (tp - 1) == 0, f"{model_id}: tp_size={tp} is not a power of two"
 
 
 def test_device_config_env_vars_are_dict():
     for model_id, entry in model_registry().items():
-        for cfg in entry.continuous_batching_configs:
+        for cfg in _all_configs(entry):
             assert isinstance(cfg.device_config.env_vars, dict), (
                 f"{model_id}: device_config.env_vars is not a dict"
             )
@@ -102,7 +117,7 @@ def test_device_config_env_vars_are_dict():
 
 def test_num_gpu_blocks_override_is_positive_or_none():
     for model_id, entry in model_registry().items():
-        for cfg in entry.continuous_batching_configs:
+        for cfg in _all_configs(entry):
             override = cfg.device_config.num_gpu_blocks_override
             if override is not None:
                 assert override > 0, (

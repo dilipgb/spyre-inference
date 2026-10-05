@@ -80,10 +80,28 @@ class ContinuousBatchingConfig:
 
 
 @dataclass
+class StaticBatchingConfig:
+    tp_size: int
+    max_model_len: int
+    max_num_seqs: int
+    device_config: DeviceConfig = field(default_factory=DeviceConfig)
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> StaticBatchingConfig:
+        return cls(
+            tp_size=d["tp_size"],
+            max_model_len=d["max_model_len"],
+            max_num_seqs=d["max_num_seqs"],
+            device_config=DeviceConfig.from_dict(d.get("device_config") or {}),
+        )
+
+
+@dataclass
 class ModelEntry:
     model_id: str
     platforms: list[str] | None
     continuous_batching_configs: list[ContinuousBatchingConfig]
+    static_batching_configs: list[StaticBatchingConfig] = field(default_factory=list)
 
     def supports_platform(self, machine: str) -> bool:
         return self.platforms is None or machine in self.platforms
@@ -95,10 +113,15 @@ class ModelEntry:
             ContinuousBatchingConfig.from_dict(c)
             for c in (d.get("continuous_batching_configs") or [])
         ]
+        sb_configs = [
+            StaticBatchingConfig.from_dict(c)
+            for c in (d.get("static_batching_configs") or [])
+        ]
         return cls(
             model_id=model_id,
             platforms=list(raw_platforms) if raw_platforms is not None else None,
             continuous_batching_configs=cb_configs,
+            static_batching_configs=sb_configs,
         )
 
 
