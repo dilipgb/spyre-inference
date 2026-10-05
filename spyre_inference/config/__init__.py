@@ -114,8 +114,7 @@ class ModelEntry:
             for c in (d.get("continuous_batching_configs") or [])
         ]
         sb_configs = [
-            StaticBatchingConfig.from_dict(c)
-            for c in (d.get("static_batching_configs") or [])
+            StaticBatchingConfig.from_dict(c) for c in (d.get("static_batching_configs") or [])
         ]
         return cls(
             model_id=model_id,

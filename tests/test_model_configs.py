@@ -41,7 +41,9 @@ def test_every_entry_is_a_model_entry():
 def test_every_entry_has_at_least_one_config():
     for model_id, entry in model_registry().items():
         has_config = entry.continuous_batching_configs or entry.static_batching_configs
-        assert has_config, f"{model_id} has no continuous_batching_configs or static_batching_configs"
+        assert has_config, (
+            f"{model_id} has no continuous_batching_configs or static_batching_configs"
+        )
 
 
 def test_all_cb_configs_are_typed():
@@ -56,9 +58,7 @@ def test_all_cb_configs_are_typed():
 def test_all_sb_configs_are_typed():
     for model_id, entry in model_registry().items():
         for cfg in entry.static_batching_configs:
-            assert isinstance(cfg, StaticBatchingConfig), (
-                f"{model_id}: unexpected type {type(cfg)}"
-            )
+            assert isinstance(cfg, StaticBatchingConfig), f"{model_id}: unexpected type {type(cfg)}"
             assert isinstance(cfg.device_config, DeviceConfig)
 
 
