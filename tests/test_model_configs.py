@@ -59,7 +59,7 @@ def test_all_configs_are_typed():
         "ibm-granite/granite-vision-4.1-4b",
         "sentence-transformers/all-MiniLM-L6-v2",
         "sentence-transformers/all-roberta-large-v1",
-        "sentence-transformers/clip-ViT-B-32",
+        "openai/clip-vit-base-patch32",
         "ibm-granite/granite-embedding-30m-english",
         "ibm-granite/granite-embedding-125m-english",
         "ibm-granite/granite-embedding-278m-multilingual",
