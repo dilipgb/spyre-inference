@@ -45,9 +45,7 @@ def test_every_entry_has_at_least_one_config():
 def test_all_configs_are_typed():
     for model_id, entry in model_registry().items():
         for cfg in entry.serving_configs:
-            assert isinstance(cfg, ServingConfig), (
-                f"{model_id}: unexpected type {type(cfg)}"
-            )
+            assert isinstance(cfg, ServingConfig), f"{model_id}: unexpected type {type(cfg)}"
             assert isinstance(cfg.device_config, DeviceConfig)
 
 

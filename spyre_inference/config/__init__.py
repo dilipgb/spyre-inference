@@ -91,9 +91,7 @@ class ModelEntry:
     @classmethod
     def from_dict(cls, model_id: str, d: dict[str, Any]) -> ModelEntry:
         raw_platforms = d.get("platforms")
-        configs = [
-            ServingConfig.from_dict(c) for c in (d.get("serving_configs") or [])
-        ]
+        configs = [ServingConfig.from_dict(c) for c in (d.get("serving_configs") or [])]
         return cls(
             model_id=model_id,
             platforms=list(raw_platforms) if raw_platforms is not None else None,
